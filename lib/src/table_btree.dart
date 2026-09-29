@@ -91,6 +91,51 @@ class SqliteTableBtree {
     );
   }
 
+  static void freeTree(
+    SqlitePagerSync pager,
+    int rootPage, {
+    int pageStart = 0,
+  }) {
+    final children = _childPages(pager, rootPage, pageStart);
+    final leaves = children.isEmpty ? [rootPage] : children;
+    final pages = <int>{rootPage, ...children};
+    for (final leaf in leaves) {
+      final page = pager.readPage(leaf);
+      final count = _readU16(page, pageStart + 3);
+      for (var index = 0; index < count; index++) {
+        final pointer = _readU16(page, pageStart + 8 + index * 2);
+        final (payloadLength, payloadHeaderLength) = SqliteVarint.read(
+          page,
+          pointer,
+        );
+        final (_, rowIdLength) = SqliteVarint.read(
+          page,
+          pointer + payloadHeaderLength,
+        );
+        final payloadStart = pointer + payloadHeaderLength + rowIdLength;
+        final localLength = _localPayloadLength(
+          payloadLength,
+          pager.header.pageSize,
+        );
+        if (payloadLength == localLength) continue;
+        var next = _readU32(page, payloadStart + localLength);
+        var remaining = payloadLength - localLength;
+        while (remaining > 0) {
+          if (next < 2 || next > pager.pageCount || !pages.add(next)) {
+            throw SqliteFormatException('invalid overflow page: $next');
+          }
+          final overflow = pager.readPage(next);
+          final used = remaining.clamp(0, pager.header.pageSize - 4);
+          remaining -= used;
+          next = _readU32(overflow, 0);
+        }
+      }
+    }
+    for (final page in pages) {
+      pager.freePage(page);
+    }
+  }
+
   static void rewriteLeafPage(
     SqlitePagerSync pager,
     int rootPage,

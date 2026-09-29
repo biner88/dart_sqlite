@@ -28,6 +28,7 @@ Future<void> main(List<String> args) async {
   parallelOpen.close();
   assert(database.select('PRAGMA user_version').single['user_version'] == 0);
   database.execute('PRAGMA user_version = 7');
+  database.execute('PRAGMA application_id = 1234');
   assert(database.select('PRAGMA user_version').single['user_version'] == 7);
   database.execute('CREATE TABLE folders (id TEXT PRIMARY KEY)');
   database.execute(
@@ -37,6 +38,41 @@ Future<void> main(List<String> args) async {
   database.execute('INSERT INTO folders VALUES (?)', ['folder']);
   database.execute('INSERT INTO files VALUES (?, ?)', ['file', 'folder']);
   database.execute('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+  database.execute('''
+    CREATE TABLE composite_parent (
+      a TEXT,
+      b TEXT,
+      PRIMARY KEY (a, b)
+    )
+  ''');
+  database.execute('''
+    CREATE TABLE composite_child (
+      a TEXT,
+      b TEXT,
+      FOREIGN KEY (a, b) REFERENCES composite_parent (a, b)
+    )
+  ''');
+  database.execute("INSERT INTO composite_parent VALUES ('a', 'b')");
+  database.execute("INSERT INTO composite_child VALUES ('a', 'b')");
+  database.execute('''
+    CREATE TABLE upsert_parent (id INTEGER PRIMARY KEY, token TEXT UNIQUE)
+  ''');
+  database.execute('''
+    CREATE TABLE upsert_child (
+      parent_id INTEGER REFERENCES upsert_parent(id)
+        ON UPDATE CASCADE ON DELETE CASCADE
+    )
+  ''');
+  database.execute("INSERT INTO upsert_parent VALUES (1, 'token')");
+  database.execute('INSERT INTO upsert_child VALUES (1)');
+  database.execute('''
+    INSERT INTO upsert_parent VALUES (2, 'token')
+    ON CONFLICT(token) DO UPDATE SET id = excluded.id
+  ''');
+  assert(
+    database.select('SELECT parent_id FROM upsert_child').single['parent_id'] ==
+        2,
+  );
   database.execute('INSERT INTO users VALUES (?, ?)', [1, 'Alice']);
   database.execute('INSERT INTO users VALUES (?, ?)', [2, 'Bob']);
   for (var id = 3; id <= 160; id++) {
@@ -62,6 +98,18 @@ Future<void> main(List<String> args) async {
     'CREATE TABLE large_rows (id INTEGER PRIMARY KEY, payload TEXT)',
   );
   database.execute('INSERT INTO large_rows VALUES (?, ?)', [1, 'z' * 12000]);
+  database.execute(
+    'CREATE TABLE dropped_rows (id INTEGER PRIMARY KEY, payload TEXT)',
+  );
+  database.execute('CREATE INDEX dropped_rows_id_idx ON dropped_rows(id)');
+  database.execute('INSERT INTO dropped_rows VALUES (?, ?)', [1, 'q' * 12000]);
+  database.execute('DROP INDEX dropped_rows_id_idx');
+  database.execute('DROP TABLE dropped_rows');
+  assert(
+    (database.select('PRAGMA freelist_count').single['freelist_count'] as int) >
+        0,
+  );
+  database.execute('DROP TABLE IF EXISTS absent_table');
   database.execute('CREATE INDEX users_name_idx ON users(name)');
   database.execute('ALTER TABLE users ADD COLUMN active INTEGER');
   assert(
@@ -75,10 +123,31 @@ Future<void> main(List<String> args) async {
     database.select('SELECT state FROM users WHERE id = 1').single['state'] ==
         'new',
   );
+  database.execute('''
+    CREATE VIEW first_users(user_id, display_name) AS
+      SELECT id, name FROM users WHERE id < 3
+  ''');
   database.close();
 
   final reopened = PureDatabase.open(path);
   assert(reopened.select('PRAGMA user_version').single['user_version'] == 7);
+  assert(
+    reopened.select('PRAGMA application_id').single['application_id'] == 1234,
+  );
+  assert(
+    reopened.select('PRAGMA foreign_key_list(composite_child)').length == 2,
+  );
+  assert(reopened.select('SELECT * FROM composite_child').length == 1);
+  assert(reopened.select('SELECT id FROM upsert_parent').single['id'] == 2);
+  assert(
+    reopened.select('SELECT parent_id FROM upsert_child').single['parent_id'] ==
+        2,
+  );
+  reopened.execute('PRAGMA foreign_keys = ON');
+  reopened.execute('DELETE FROM upsert_parent WHERE id = 2');
+  assert(reopened.select('SELECT * FROM upsert_child').isEmpty);
+  assert(reopened.select('SELECT * FROM first_users').length == 2);
+  reopened.execute('DROP VIEW first_users');
   assert(reopened.select('SELECT id FROM files').single['id'] == 'file');
   final rows = reopened.select(
     'SELECT id, name, active, state FROM users ORDER BY id',
@@ -142,6 +211,12 @@ Future<void> main(List<String> args) async {
   final recovered = PureDatabase.open(path);
   assert(recovered.select('SELECT id FROM users WHERE id = 999').length == 1);
   recovered.close();
+  final droppedSchemaCheck = Process.runSync('sqlite3', [
+    path,
+    'PRAGMA integrity_check;',
+  ]);
+  assert(droppedSchemaCheck.exitCode == 0, droppedSchemaCheck.stderr);
+  assert(droppedSchemaCheck.stdout.trim() == 'ok');
 
   final crashPath = '${directory.path}/native-journal.sqlite';
   PureDatabase.open(crashPath)

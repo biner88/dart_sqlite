@@ -1,34 +1,30 @@
 # dart_sqlite
 
-`dart_sqlite` is a dependency-free, pure-Dart SQLite-compatible engine for Dart VM applications. It reads and writes SQLite 3 database files and implements the SQL and database API needed by this repository's application.
+A dependency-free, pure-Dart SQLite-compatible engine for synchronous Dart VM applications. It reads and writes SQLite 3 database files without native SQLite or FFI.
 
-Status: experimental and application-focused. Review the compatibility notes below before using it with other workloads.
+> Status: experimental and application-focused. “SQLite-compatible” describes the database file format and the subset listed below; it does not mean full SQLite SQL semantics or a drop-in replacement for every `package:sqlite3` API.
 
-This is a focused compatibility implementation, not a complete SQLite engine or a drop-in replacement for every API in the `sqlite3` package. It uses Dart file I/O and does not call native SQLite through FFI.
+## What it provides
 
-## Features
+- In-memory databases and persistent database files.
+- Positional SQL parameters, transactions, and synchronous `execute` / `select` APIs.
+- SQLite table/index B-trees, overflow pages, rollback-journal recovery, and WAL read/write support.
+- A small `sqlite3.open` facade for call sites using `execute`, `select`, `updatedRows`, and `dispose`.
+- No runtime package dependencies.
 
-* In-memory and persistent file databases.
-* Parameterized SQL, transactions, and synchronous `execute`/`select` APIs.
-* SQLite 3 database pages, table and index B-trees, overflow pages, rollback-journal recovery, and WAL reading/writing.
-* Application-used DDL and DML, constraints, indexes, joins, grouping, aggregates,        `CASE`, and scalar/correlated subqueries.
-* A small `sqlite3.open` compatibility facade for applications that use `Database.execute`,        `Database.select`,        `updatedRows`, and `dispose`.
-* No runtime dependencies in this package.
+## Install
 
-## Add the package
-
-The package is currently local to this repository and is not published to pub.dev. Add it as a path dependency:
+This package is not published on pub.dev. Use a path dependency:
 
 ```yaml
 dependencies:
-  dart_sqlite: ^0.1.0
+  dart_sqlite:
+    path: ../dart_sqlite
 ```
 
-For another project, set `path` to the location of the `dart_sqlite` package relative to that project's `pubspec.yaml` .
+Adjust the path relative to the consuming project's `pubspec.yaml`.
 
 ## Quick start
-
-Use `PureDatabase` for the engine's direct API. The same API works with an in-memory database or a persistent SQLite file.
 
 ```dart
 import 'package:dart_sqlite/dart_sqlite.dart';
@@ -55,54 +51,68 @@ void main() {
 }
 ```
 
-Open a persistent database with `PureDatabase.open` :
+Use `PureDatabase.open(path)` for a persistent file. `PureDatabase.transaction` commits on success and rolls back when the callback throws. Nested transactions are not supported for persistent databases.
 
-```dart
-import 'package:dart_sqlite/dart_sqlite.dart';
+## Supported SQL
 
-void main() {
-  final db = PureDatabase.open(
-    'data/app.sqlite',
-    busyTimeout: const Duration(seconds: 5),
-  );
-  try {
-    db.execute('''
-      CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        name TEXT NOT NULL
-      )
-    ''');
-    db.execute('INSERT INTO users (name) VALUES (?)', ['Grace']);
-    final users = db.select('SELECT id, name FROM users ORDER BY id');
-    print(users.last['name']);
-  } finally {
-    db.close();
-  }
-}
-```
+`execute()` accepts one statement or a semicolon-separated script. Bind values
+with a positional list or a map for named placeholders. A trailing semicolon is
+optional.
 
-`PureDatabase.transaction` commits when the callback returns and rolls back if it throws:
+| Area | Supported subset |
+| --- | --- |
+| DDL | `CREATE TABLE [IF NOT EXISTS]`; `CREATE VIEW [IF NOT EXISTS]` with optional output-column names; `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` on columns, including partial indexes; `DROP TABLE` / `DROP VIEW` / `DROP INDEX [IF EXISTS]`; `ALTER TABLE ... ADD [COLUMN]` with declared types, `NOT NULL`, and literal `DEFAULT` |
+| DML | Multi-row `INSERT [OR IGNORE\|REPLACE] INTO ... VALUES (...)`, `DEFAULT VALUES`, and `INSERT ... SELECT`; UPSERT `ON CONFLICT (...) DO NOTHING` or `DO UPDATE SET ... [WHERE ...]`; `UPDATE [OR ABORT\|IGNORE\|REPLACE] ... SET ... [WHERE ...]`; `DELETE FROM ... [WHERE ...]` |
+| Query | `SELECT` with or without `FROM`, derived tables in `FROM` and joins, non-recursive `WITH` CTEs, `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`, `DISTINCT`, `AS` aliases, `WHERE`, inner/left/right/full/cross/natural joins with `ON` or `USING`, `GROUP BY`, `HAVING`, expression/ordinal `ORDER BY`, `LIMIT`, and `OFFSET`; `*` and qualified columns are supported |
+| Schema constraints | Column `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, literal `DEFAULT`, `CHECK`, and `REFERENCES`; table-level primary key, unique, foreign key, and `CHECK` constraints; foreign-key `ON DELETE` / `ON UPDATE` actions `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, and `SET DEFAULT` |
+| Collations | `BINARY` and ASCII `NOCASE` on columns; `ORDER BY ... COLLATE NOCASE` |
+| Transactions | `BEGIN [DEFERRED\|IMMEDIATE\|EXCLUSIVE]`, `COMMIT` / `END`, and `ROLLBACK` |
+| Parameters | Positional `?` and numbered `?NNN`; named `:name`, `@name`, and `$name` placeholders; use a list in slot order or a name map (map keys may include the prefix). Values can be `null`, numbers, strings, booleans, or `List<int>` blobs |
 
-```dart
-import 'package:dart_sqlite/dart_sqlite.dart';
+Expressions support literals, column references, parentheses, searched `CASE`, unary and arithmetic operators, comparisons, `IS [NOT] [DISTINCT FROM]`, `BETWEEN`, `LIKE` / `GLOB` / `REGEXP`, `IN` lists and subqueries, `EXISTS`, bitwise operators, concatenation, and `CAST`. Scalar and correlated scalar subqueries are supported in expressions. Single-quoted strings, `--` line comments, and block comments are supported. Unquoted identifiers accept Unicode letters and digits; double-quoted, backtick, and bracket identifiers are also accepted.
 
-void main() {
-  final db = PureDatabase.memory();
-  try {
-    db.execute('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
-    db.execute("INSERT INTO users VALUES (1, 'Grace')");
-    db.transaction((transaction) {
-      transaction.execute('UPDATE users SET name = ? WHERE id = ?', ['Ada', 1]);
-    });
-  } finally {
-    db.close();
-  }
-}
-```
+### Functions
 
-## Replacing `sqlite3` call sites
+- Scalar: `ABS`, `CHAR`, `COALESCE`, `CONCAT`, `CONCAT_WS`, `DATE`, `DATETIME`, `HEX`, `IFNULL`, `IIF`, `INSTR`, `JULIANDAY`, `LENGTH`, `LIKELIHOOD`, `LIKELY`, `LOWER`, `LTRIM`, `NULLIF`, `QUOTE`, `RANDOM`, `RANDOMBLOB`, `REPLACE`, `ROUND`, `RTRIM`, `STRFTIME`, `SUBSTR` / `SUBSTRING`, `TIME`, `TRIM`, `TYPEOF`, `UNICODE`, `UNIXEPOCH`, `UNLIKELY`, `UPPER`, and `ZEROBLOB`.
+- Math: `ACOS`, `ACOSH`, `ASIN`, `ASINH`, `ATAN`, `ATAN2`, `ATANH`, `CEIL` / `CEILING`, `COS`, `COSH`, `DEGREES`, `EXP`, `FLOOR`, `LN`, `LOG`, `LOG10`, `LOG2`, `MOD`, `PI`, `POW` / `POWER`, `RADIANS`, `SIGN`, `SIN`, `SINH`, `SQRT`, `TAN`, `TANH`, and `TRUNC`. Out-of-domain or non-finite results return `NULL`.
+- Aggregates: `AVG`, `COUNT`, `GROUP_CONCAT`, `MAX`, `MIN`, `SUM`, and `TOTAL`; aggregates support `DISTINCT`, and `COUNT(*)` is supported.
+- Date functions implement common ISO-8601 and Unix timestamp inputs, a subset of SQLite date modifiers, and common `strftime` directives; they are not a full date/time compatibility layer.
+- `RANDOMBLOB` / `ZEROBLOB` are limited to 16 MiB per result.
 
-For applications using the small compatibility surface implemented here, the import and package dependency can be switched while keeping their SQL text and call pattern:
+### Supported PRAGMAs
+
+Read/write settings: `application_id`, `user_version`, `foreign_keys`, `busy_timeout`, `synchronous`, and `journal_mode` (`DELETE` / `WAL` for persistent databases; in-memory reports `memory`). Read-only inspection includes `integrity_check`, `quick_check`, `table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `foreign_key_check`, `database_list`, `table_list`, `collation_list`, `function_list`, `pragma_list`, `encoding`, `page_size`, `page_count`, `freelist_count`, and `auto_vacuum`.
+
+## Not supported
+
+- Full SQLite grammar: recursive CTEs, window functions, and DML `RETURNING`.
+- Other DDL: rename/drop-column forms of `ALTER TABLE`, triggers, virtual tables, and `AUTOINCREMENT` sequence persistence.
+- Other DML: `UPDATE OR FAIL` / `OR ROLLBACK` and `UPDATE` / `DELETE ... RETURNING`. UPSERT supports one conflict clause with column-only targets; target predicates and multiple clauses are not supported.
+- Other expression syntax: row values and `RAISE()`. A named-parameter map cannot bind positional placeholders; use one binding style per statement.
+- SQL functions and PRAGMAs not listed above. SQLite's extension, loadable-function, virtual-table, and compile-option ecosystem is intentionally not implied by these lists.
+
+Unsupported SQL and functions raise `SqliteException`. Malformed or unsupported database-file data raises `SqliteFormatException`.
+
+## Compatibility boundaries
+
+### SQL and API behavior
+
+- This is a subset engine, not a full SQLite interpreter. SQLite type affinity, coercion, and expression `NULL` behavior are not reproduced completely. `LIKE` supports `%` and `_` and SQLite-style ASCII case-insensitive matching. Do not assume SQL accepted by SQLite will work here.
+- Foreign-key enforcement is off by default. When enabled with `PRAGMA foreign_keys = ON`, column- and table-level references and the listed immediate `ON DELETE` / `ON UPDATE` actions are applied on writes. Deferred checks are not implemented.
+- `PRAGMA synchronous` accepts and reports SQLite-style values, but does not select different durability modes; file writes are flushed synchronously.
+- Transaction mode keywords are accepted, but do not provide SQLite's full distinction between deferred, immediate, and exclusive transaction semantics.
+
+### SQLite files and runtime
+
+- Persistent storage uses `dart:io` and works on Dart VM, not Dart Web. `sqlite3.open(':memory:')` is not supported; use `PureDatabase.memory()`.
+- The engine reads and writes SQLite 3 database files only when their schema and operations fit the supported subset. File-format compatibility does not imply SQL or feature compatibility for arbitrary SQLite databases.
+- Rollback-journal files and WAL files are supported. WAL is scanned directly rather than through SQLite's shared-memory wal-index. Readers can see the last committed snapshot while a WAL writer is active; switching to `DELETE` checkpoints committed WAL pages. Automatic WAL-size checkpointing is not implemented.
+- File locks and `busy_timeout` are implemented, with tests for interaction with native SQLite processes. Do not run simultaneous native SQLite writers against a database while this engine is open, especially in WAL mode.
+- The package tests check representative SQLite CLI interoperability, journal recovery, locks, and WAL behavior. Passing them does not establish full SQLite compatibility or validate every application migration/query.
+
+### `sqlite3` facade
+
+For existing code that uses only the small facade, the import and call pattern can be switched:
 
 ```dart
 import 'package:dart_sqlite/dart_sqlite.dart';
@@ -111,41 +121,18 @@ void main() {
   final db = sqlite3.open('data/app.sqlite');
   try {
     db.execute('INSERT INTO users (name) VALUES (?)', ['Ada']);
-    print('Changed rows: ${db.updatedRows}');
-
-    final rows = db.select('SELECT id, name FROM users ORDER BY id');
-    print(rows.first['name']);
+    print(db.updatedRows);
+    print(db.select('SELECT id, name FROM users ORDER BY id').first['name']);
   } on SqliteException catch (error) {
-    print('Database error: $error');
+    print(error);
   } finally {
     db.dispose();
   }
 }
 ```
 
-The compatibility facade currently provides `sqlite3.open(path)` , `Database.execute` , `Database.select` , `Database.updatedRows` , `Database.dispose` , `Row` , and `SqliteException` . It does not provide the complete `sqlite3` package API. Use `PureDatabase.memory()` for an in-memory database; `sqlite3.open(':memory:')` is not supported.
-
-## SQL support
-
-The implemented subset targets the migrations and queries used by the bundled application. It includes:
-
-* `CREATE TABLE`,  `CREATE INDEX` (including unique and partial indexes),        `ALTER TABLE ... ADD COLUMN`,        `INSERT`,        `UPDATE`, and `DELETE`.
-* `SELECT` with parameters,        `WHERE`,        `INNER JOIN`,        `LEFT JOIN`,        `GROUP BY`, multi-term `ORDER BY`,        `LIMIT`, and `OFFSET`.
-* `CASE`, scalar and correlated subqueries in the application's query forms, and `COUNT`,        `SUM`,        `MAX`,        `COUNT(DISTINCT ...)`,        `COALESCE`,        `LOWER`,        `UPPER`, and a subset of `strftime`.
-* Primary/unique/not-null/check constraints, the implemented column-level foreign-key checks, and `BINARY`/ASCII `NOCASE` collations.
-* `BEGIN`,        `COMMIT`,        `ROLLBACK`,        `PRAGMA user_version`,        `foreign_keys`,        `busy_timeout`,        `synchronous`, and the application's `journal_mode` request.
-
-Unsupported syntax and functions throw `SqliteException` ; this package does not silently delegate SQL to a native SQLite library.
-
-## Persistence and compatibility notes
-
-* Persistent databases require Dart VM file I/O (`dart:io`); Web is not supported.
-* Persistent databases default to SQLite's rollback-journal mode. `PRAGMA journal_mode = WAL` enables a standard SQLite WAL file;  `PRAGMA journal_mode` reports the active mode, and readers can continue reading the last committed snapshot while a WAL writer is active. Switching back to `DELETE` checkpoints committed WAL pages into the database file.
-* WAL compatibility currently uses direct WAL scanning instead of SQLite's shared-memory wal-index. Do not run simultaneous native SQLite writers against a database while this engine is open; automatic WAL-size checkpointing is not implemented, so long-lived WAL files should be checkpointed by switching to `DELETE` when appropriate.
-* The compatibility facade covers the API used by this repository, not all APIs in `package:sqlite3`.
-* This engine has a deliberately limited SQL and SQLite-file-format surface. It does not currently implement triggers, views, CTEs, window functions, FTS, virtual tables, or SQLite extensions. See the package tests for the currently verified behavior.
+The facade provides `sqlite3.open(path)`, `Database.execute`, `Database.select`, `Database.updatedRows`, `Database.dispose`, `Row`, `ResultSet`, and `SqliteException`. It does not provide the complete `package:sqlite3` API (for example, prepared-statement objects or `sqlite3.open(':memory:')`). Use `PureDatabase` when the in-memory API or transaction callback is needed.
 
 ## License
 
-This package is licensed under the [MIT license](https://opensource.org/licenses/MIT).
-See [LICENSE](LICENSE) for more information.
+MIT. See [LICENSE](LICENSE).

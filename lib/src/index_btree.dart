@@ -84,6 +84,13 @@ class SqliteIndexBtree {
     );
   }
 
+  static void freeTree(SqlitePagerSync pager, int rootPage) {
+    final children = _childPages(pager, rootPage);
+    for (final page in [...children, rootPage]) {
+      pager.freePage(page);
+    }
+  }
+
   static List<_PackedIndexPage> _pack(
     List<SqliteIndexEntry> entries,
     int pageSize,
