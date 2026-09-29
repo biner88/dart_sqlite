@@ -96,6 +96,42 @@ Future<void> main(List<String> args) async {
     "INSERT INTO persistent_drop_column VALUES (1, 'gone', 'kept')",
   );
   database.execute('ALTER TABLE persistent_drop_column DROP COLUMN remove_me');
+  database.execute(
+    'CREATE TABLE persistent_update_fail (id INTEGER PRIMARY KEY, value TEXT UNIQUE)',
+  );
+  database.execute(
+    "INSERT INTO persistent_update_fail VALUES (1, 'one'), (2, 'two')",
+  );
+  try {
+    database.execute('''
+      UPDATE OR FAIL persistent_update_fail
+      SET value = 'changed'
+    ''');
+    assert(false, 'persistent UPDATE OR FAIL should fail');
+  } on PureSqlException {
+    // Expected; the first row is committed despite the statement error.
+  }
+  database.execute(
+    'CREATE TABLE persistent_rollback_conflict (id INTEGER PRIMARY KEY, value TEXT UNIQUE)',
+  );
+  database.execute(
+    "INSERT INTO persistent_rollback_conflict VALUES (1, 'one')",
+  );
+  database.execute('BEGIN');
+  database.execute(
+    "INSERT INTO persistent_rollback_conflict VALUES (2, 'two')",
+  );
+  try {
+    database.execute(
+      "UPDATE OR ROLLBACK persistent_rollback_conflict SET value = 'one' WHERE id = 2",
+    );
+    assert(false, 'persistent UPDATE OR ROLLBACK should fail');
+  } on PureSqlException {
+    // Expected; the active transaction is rolled back.
+  }
+  assert(
+    database.select('SELECT id FROM persistent_rollback_conflict').length == 1,
+  );
   database.execute('''
     CREATE TABLE upsert_parent (id INTEGER PRIMARY KEY, token TEXT UNIQUE)
   ''');
@@ -219,6 +255,21 @@ Future<void> main(List<String> args) async {
   assert(
     reopened.select('SELECT keep FROM persistent_drop_column').single['keep'] ==
         'kept',
+  );
+  assert(
+    reopened
+            .select('SELECT value FROM persistent_update_fail WHERE id = 1')
+            .single['value'] ==
+        'changed',
+  );
+  assert(
+    reopened
+            .select('SELECT value FROM persistent_update_fail WHERE id = 2')
+            .single['value'] ==
+        'two',
+  );
+  assert(
+    reopened.select('SELECT id FROM persistent_rollback_conflict').length == 1,
   );
   assert(reopened.select('SELECT id FROM upsert_parent').single['id'] == 2);
   assert(

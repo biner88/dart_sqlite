@@ -30,6 +30,14 @@ class SqliteException implements Exception {
   String toString() => 'SqliteException: $message';
 }
 
+class _ConflictFailException implements Exception {
+  _ConflictFailException(this.error, this.stackTrace, this.changes);
+
+  final Object error;
+  final StackTrace stackTrace;
+  final int changes;
+}
+
 /// Compatibility name for [SqliteException].
 typedef PureSqlException = SqliteException;
 
@@ -127,9 +135,25 @@ class PureDatabase {
     }
 
     if (_pager != null && !_inTransaction && statement is! _Select) {
-      return _persistentWrite(run);
+      _ConflictFailException? failure;
+      final changed = _persistentWrite(() {
+        try {
+          return run();
+        } on _ConflictFailException catch (error) {
+          failure = error;
+          return error.changes;
+        }
+      });
+      if (failure != null) {
+        Error.throwWithStackTrace(failure!.error, failure!.stackTrace);
+      }
+      return changed;
     }
-    return run();
+    try {
+      return run();
+    } on _ConflictFailException catch (failure) {
+      Error.throwWithStackTrace(failure.error, failure.stackTrace);
+    }
   }
 
   bool _changesSchema(_Statement statement) => switch (statement) {
@@ -777,8 +801,10 @@ class PureDatabase {
         table.foreignKeyConstraints.isNotEmpty ||
         column.primaryKey ||
         column.unique ||
-        column.checkExpressions.isNotEmpty ||
-        column.referencesTable != null) {
+        table.columns.any(
+          (item) =>
+              item.checkExpressions.isNotEmpty || item.referencesTable != null,
+        )) {
       throw PureSqlException(
         'cannot drop a column with indexes or constraints',
       );
@@ -1577,12 +1603,27 @@ class PureDatabase {
                 [for (final value in row.values) _Literal(value)],
             ];
       for (final values in rows) {
-        changed += _insertRow(statement, table, values, parameters);
+        final rowBefore = statement.conflict == 'fail' ? _snapshotRows() : null;
+        try {
+          changed += _insertRow(statement, table, values, parameters);
+        } catch (error, stackTrace) {
+          if (rowBefore != null && _isIgnorableUpdateError(error, table)) {
+            _restoreRows(rowBefore);
+            throw _ConflictFailException(error, stackTrace, changed);
+          }
+          rethrow;
+        }
       }
       return changed;
-    } catch (_) {
+    } catch (error) {
+      if (error is _ConflictFailException) rethrow;
       _restoreRows(before);
       table.nextRowId = oldNextRowId;
+      if (statement.conflict == 'rollback' &&
+          _inTransaction &&
+          _isIgnorableUpdateError(error, table)) {
+        _rollback();
+      }
       rethrow;
     }
   }
@@ -1693,7 +1734,8 @@ class PureDatabase {
       }
     }
     if (statement.conflict == 'ignore' && conflicts.isNotEmpty) return 0;
-    if (statement.conflict == 'abort' && conflicts.isNotEmpty) {
+    if (const ['abort', 'fail', 'rollback'].contains(statement.conflict) &&
+        conflicts.isNotEmpty) {
       throw PureSqlException('UNIQUE constraint failed: ${table.name}');
     }
     final before = _snapshotRows();
@@ -1995,7 +2037,8 @@ class PureDatabase {
             }
           }
         }
-        final rowBefore = statement.conflict == 'ignore'
+        final rowBefore =
+            statement.conflict == 'ignore' || statement.conflict == 'fail'
             ? _snapshotRows()
             : null;
         final changedBefore = Set<_Table>.from(changedTables);
@@ -2006,11 +2049,13 @@ class PureDatabase {
               _validateIndexRows(index, changed.rows);
             }
           }
-        } catch (error) {
+        } catch (error, stackTrace) {
           if (rowBefore != null && _isIgnorableUpdateError(error, table)) {
             _restoreRows(rowBefore);
             changedTables.retainAll(changedBefore);
-            continue;
+            if (statement.conflict == 'ignore') continue;
+            _rewriteChangedTables(changedTables);
+            throw _ConflictFailException(error, stackTrace, count);
           }
           rethrow;
         }
@@ -2027,8 +2072,14 @@ class PureDatabase {
         }
         _rewriteChangedTables(changedTables);
       }
-    } catch (_) {
+    } catch (error) {
+      if (error is _ConflictFailException) rethrow;
       _restoreRows(before);
+      if (statement.conflict == 'rollback' &&
+          _inTransaction &&
+          _isIgnorableUpdateError(error, table)) {
+        _rollback();
+      }
       rethrow;
     }
     return count;
@@ -2037,7 +2088,8 @@ class PureDatabase {
   bool _isIgnorableUpdateError(Object error, _Table table) {
     if (error is! SqliteException) return false;
     final message = error.message;
-    return message.startsWith('UNIQUE constraint failed: ${table.name}.') ||
+    return message == 'UNIQUE constraint failed: ${table.name}' ||
+        message.startsWith('UNIQUE constraint failed: ${table.name}.') ||
         table.indexes.any(
           (index) => message == 'UNIQUE constraint failed: ${index.name}',
         ) ||
@@ -6133,6 +6185,12 @@ class _Parser {
         conflict = 'ignore';
       } else if (_acceptWord('REPLACE')) {
         conflict = 'replace';
+      } else if (_acceptWord('FAIL')) {
+        conflict = 'fail';
+      } else if (_acceptWord('ROLLBACK')) {
+        conflict = 'rollback';
+      } else if (_acceptWord('ABORT')) {
+        conflict = 'abort';
       } else {
         throw PureSqlException('unsupported INSERT conflict action');
       }
@@ -6475,6 +6533,10 @@ class _Parser {
         conflict = 'ignore';
       } else if (_acceptWord('REPLACE')) {
         conflict = 'replace';
+      } else if (_acceptWord('FAIL')) {
+        conflict = 'fail';
+      } else if (_acceptWord('ROLLBACK')) {
+        conflict = 'rollback';
       } else {
         throw PureSqlException('unsupported UPDATE conflict action');
       }

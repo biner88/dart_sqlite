@@ -379,6 +379,90 @@ void main() {
         'good',
   );
 
+  final updateFailDb = PureDatabase.memory();
+  updateFailDb.execute(
+    'CREATE TABLE update_fail (id INTEGER PRIMARY KEY, value TEXT UNIQUE)',
+  );
+  updateFailDb.execute(
+    "INSERT INTO update_fail VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+  );
+  try {
+    updateFailDb.execute('''
+      UPDATE OR FAIL update_fail
+      SET value = 'changed'
+    ''');
+    assert(false, 'UPDATE OR FAIL should stop at the conflicting row');
+  } on PureSqlException {
+    // Expected; the earlier row remains changed.
+  }
+  assert(
+    updateFailDb
+            .select('SELECT value FROM update_fail WHERE id = 1')
+            .single['value'] ==
+        'changed',
+  );
+  assert(
+    updateFailDb
+            .select('SELECT value FROM update_fail WHERE id = 2')
+            .single['value'] ==
+        'two',
+  );
+  assert(
+    updateFailDb
+            .select('SELECT value FROM update_fail WHERE id = 3')
+            .single['value'] ==
+        'three',
+  );
+
+  final insertFailDb = PureDatabase.memory();
+  insertFailDb.execute(
+    'CREATE TABLE insert_fail (id INTEGER PRIMARY KEY, value TEXT UNIQUE)',
+  );
+  try {
+    insertFailDb.execute('''
+      INSERT OR FAIL INTO insert_fail VALUES
+        (1, 'one'), (2, 'two'), (3, 'two')
+    ''');
+    assert(false, 'INSERT OR FAIL should stop at the conflicting row');
+  } on PureSqlException {
+    // Expected; earlier rows remain inserted.
+  }
+  assert(
+    insertFailDb.select('SELECT id FROM insert_fail ORDER BY id').length == 2,
+  );
+
+  final rollbackConflictDb = PureDatabase.memory();
+  rollbackConflictDb.execute(
+    'CREATE TABLE rollback_conflict (id INTEGER PRIMARY KEY, value TEXT UNIQUE)',
+  );
+  rollbackConflictDb.execute("INSERT INTO rollback_conflict VALUES (1, 'one')");
+  rollbackConflictDb.execute('BEGIN');
+  rollbackConflictDb.execute("INSERT INTO rollback_conflict VALUES (2, 'two')");
+  try {
+    rollbackConflictDb.execute(
+      "UPDATE OR ROLLBACK rollback_conflict SET value = 'one' WHERE id = 2",
+    );
+    assert(false, 'UPDATE OR ROLLBACK should fail on a unique conflict');
+  } on PureSqlException {
+    // Expected; the whole SQL transaction is rolled back.
+  }
+  assert(
+    rollbackConflictDb.select('SELECT id FROM rollback_conflict').length == 1,
+  );
+  rollbackConflictDb.execute('BEGIN');
+  try {
+    rollbackConflictDb.execute('''
+      INSERT OR ROLLBACK INTO rollback_conflict VALUES
+        (2, 'two'), (3, 'three'), (4, 'one')
+    ''');
+    assert(false, 'INSERT OR ROLLBACK should fail on a unique conflict');
+  } on PureSqlException {
+    // Expected; the transaction rolls back both earlier inserts.
+  }
+  assert(
+    rollbackConflictDb.select('SELECT id FROM rollback_conflict').length == 1,
+  );
+
   final disabledFkDb = PureDatabase.memory();
   disabledFkDb.execute('CREATE TABLE disabled_parent (id INTEGER PRIMARY KEY)');
   disabledFkDb.execute('''
@@ -483,6 +567,19 @@ void main() {
         )[1]['name'] ==
         'new value',
   );
+  renameColumnDb.execute('''
+    CREATE TABLE rename_column_child (
+      parent_id INTEGER REFERENCES rename_column_probe
+    )
+  ''');
+  try {
+    renameColumnDb.execute('''
+      ALTER TABLE rename_column_probe RENAME COLUMN id TO new_id
+    ''');
+    assert(false, 'renaming a referenced implicit primary key should fail');
+  } on PureSqlException {
+    // Expected; implicit REFERENCES targets the parent primary key.
+  }
   renameColumnDb.execute('BEGIN');
   renameColumnDb.execute('''
     ALTER TABLE rename_column_probe RENAME COLUMN "new value" TO rolled_back

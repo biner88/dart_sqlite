@@ -61,8 +61,8 @@ optional.
 
 | Area | Supported subset |
 | --- | --- |
-| DDL | `CREATE TABLE [IF NOT EXISTS]`; `CREATE VIEW [IF NOT EXISTS]` with optional output-column names; `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` on columns, including partial indexes; `DROP TABLE` / `DROP VIEW` / `DROP INDEX [IF EXISTS]`; `ALTER TABLE ... ADD [COLUMN]` with declared types, `NOT NULL`, and literal `DEFAULT`; `ALTER TABLE ... RENAME TO`; and dependency-free `ALTER TABLE ... RENAME COLUMN` / `DROP COLUMN` |
-| DML | Multi-row `INSERT [OR IGNORE\|REPLACE] INTO ... VALUES (...)`, `DEFAULT VALUES`, and `INSERT ... SELECT`; UPSERT `ON CONFLICT (...) DO NOTHING` or `DO UPDATE SET ... [WHERE ...]`; `UPDATE [OR ABORT\|IGNORE\|REPLACE] ... SET ... [WHERE ...]`; `DELETE FROM ... [WHERE ...]` |
+| DDL | `CREATE TABLE [IF NOT EXISTS]`; `CREATE VIEW [IF NOT EXISTS]` with optional output-column names; `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` on columns, including partial indexes; `DROP TABLE` / `DROP VIEW` / `DROP INDEX [IF EXISTS]`; `ALTER TABLE ... ADD [COLUMN]` with declared types, `NOT NULL`, and literal `DEFAULT`; `ALTER TABLE ... RENAME TO`; and basic `ALTER TABLE ... RENAME COLUMN` / `DROP COLUMN` |
+| DML | Multi-row `INSERT [OR ABORT\|FAIL\|IGNORE\|REPLACE\|ROLLBACK] INTO ... VALUES (...)`, `DEFAULT VALUES`, and `INSERT ... SELECT`; UPSERT `ON CONFLICT (...) DO NOTHING` or `DO UPDATE SET ... [WHERE ...]`; `UPDATE [OR ABORT\|FAIL\|IGNORE\|REPLACE\|ROLLBACK] ... SET ... [WHERE ...]`; `DELETE FROM ... [WHERE ...]` |
 | Query | `SELECT` with or without `FROM`, derived tables in `FROM` and joins, non-recursive `WITH` CTEs, `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`, `DISTINCT`, `AS` aliases, `WHERE`, inner/left/right/full/cross/natural joins with `ON` or `USING`, `GROUP BY`, `HAVING`, expression/ordinal `ORDER BY`, `LIMIT`, and `OFFSET`; `*` and qualified columns are supported |
 | Schema constraints | Column `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, literal `DEFAULT`, `CHECK`, and `REFERENCES`; table-level primary key, unique, foreign key, and `CHECK` constraints; foreign-key `ON DELETE` / `ON UPDATE` actions `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, and `SET DEFAULT` |
 | Collations | `BINARY` and ASCII `NOCASE` on columns; `ORDER BY ... COLLATE NOCASE` |
@@ -86,10 +86,11 @@ Read/write settings: `application_id`, `schema_version`, `user_version`, `foreig
 ## Not supported
 
 - Full SQLite grammar: recursive CTEs, window functions, and DML `RETURNING`.
-- Other DDL: triggers, virtual tables, and `AUTOINCREMENT` sequence persistence. Column rename/drop are limited to tables without indexes, constraints, foreign-key references, or dependent views.
-- Other DML: `UPDATE OR FAIL` / `OR ROLLBACK` and `UPDATE` / `DELETE ... RETURNING`. UPSERT supports one conflict clause with column-only targets; target predicates and multiple clauses are not supported.
+- Other DDL: triggers, virtual tables, and `AUTOINCREMENT` sequence persistence. Column rename/drop reject indexes, table constraints, CHECK or foreign-key definitions, external foreign-key references, and dependent views; a rowid primary-key column cannot be dropped.
+- Other DML: DML `RETURNING`. UPSERT supports one conflict clause with column-only targets; target predicates and multiple clauses are not supported.
 - Other expression syntax: row values and `RAISE()`. A named-parameter map cannot bind positional placeholders; use one binding style per statement.
-- SQL functions and PRAGMAs not listed above. SQLite's extension, loadable-function, virtual-table, and compile-option ecosystem is intentionally not implied by these lists.
+- Built-in SQL functions not listed above, user-defined functions, and loadable extensions.
+- PRAGMAs not listed above; SQLite compile-option and extension ecosystems are not implied by this list.
 
 Unsupported SQL and functions raise `SqliteException`. Malformed or unsupported database-file data raises `SqliteFormatException`.
 
@@ -100,6 +101,7 @@ Unsupported SQL and functions raise `SqliteException`. Malformed or unsupported 
 - This is a subset engine, not a full SQLite interpreter. SQLite type affinity, coercion, and expression `NULL` behavior are not reproduced completely. `LIKE` supports `%` and `_` and SQLite-style ASCII case-insensitive matching. Do not assume SQL accepted by SQLite will work here.
 - Foreign-key enforcement is off by default. When enabled with `PRAGMA foreign_keys = ON`, column- and table-level references and the listed immediate `ON DELETE` / `ON UPDATE` actions are applied on writes. Deferred checks are not implemented.
 - `PRAGMA synchronous` accepts and reports SQLite-style values, but does not select different durability modes; file writes are flushed synchronously.
+- `OR FAIL` preserves earlier rows changed by the statement; `OR ROLLBACK` rolls back an active SQL transaction on UNIQUE, NOT NULL, or CHECK conflicts. Foreign-key failures retain ABORT behavior.
 - Transaction mode keywords are accepted, but do not provide SQLite's full distinction between deferred, immediate, and exclusive transaction semantics.
 
 ### SQLite files and runtime
