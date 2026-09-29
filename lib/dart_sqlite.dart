@@ -12,26 +12,40 @@ export 'src/sqlite_format.dart';
 export 'src/table_btree.dart';
 export 'src/index_btree.dart';
 
+/// A SQL result row, keyed by the selected column names.
 typedef SqlRow = Map<String, Object?>;
 
+/// An error raised for unsupported SQL or a failed database operation.
 class SqliteException implements Exception {
+  /// Creates an exception with a human-readable [message].
   SqliteException(this.message);
 
+  /// The reason the SQL operation failed.
   final String message;
 
   @override
   String toString() => 'SqliteException: $message';
 }
 
+/// Compatibility name for [SqliteException].
 typedef PureSqlException = SqliteException;
 
+/// A synchronous SQLite-compatible database.
+///
+/// Use [memory] for a transient database or [open] for a persistent SQLite
+/// file. The supported SQL syntax is a subset of SQLite; unsupported
+/// statements throw [SqliteException].
 class PureDatabase {
   PureDatabase._(Map<String, _Table> tables, [this._pager])
     : _tables = tables,
       _indexes = {};
 
+  /// Creates an in-memory database that is discarded when closed.
   factory PureDatabase.memory() => PureDatabase._({});
 
+  /// Opens or creates a persistent SQLite database at [path].
+  ///
+  /// [busyTimeout] controls how long lock acquisition waits before failing.
   factory PureDatabase.open(
     String path, {
     Duration busyTimeout = Duration.zero,
@@ -63,6 +77,10 @@ class PureDatabase {
   SqliteRollbackJournal? _transactionJournal;
   Map<String, _Table>? _memoryTransactionTables;
 
+  /// Executes one supported SQL statement with positional [parameters].
+  ///
+  /// Returns the number of rows changed by `INSERT`, `UPDATE`, or `DELETE`;
+  /// other supported statements return zero.
   int execute(String sql, [List<Object?> parameters = const []]) {
     final statement = _Parser(sql).parse();
     final values = parameters.map(_value).toList(growable: false);
@@ -82,6 +100,9 @@ class PureDatabase {
     return _execute(statement, values, sql);
   }
 
+  /// Runs a `SELECT` or read-only `PRAGMA` and returns its rows.
+  ///
+  /// Use `?` placeholders in [sql] for positional [parameters].
   List<SqlRow> select(String sql, [List<Object?> parameters = const []]) {
     final statement = _Parser(sql).parse();
     if (statement is _Pragma) {
@@ -101,6 +122,9 @@ class PureDatabase {
     return _withCurrentFile(() => _select(statement, values));
   }
 
+  /// Commits [action] on success and rolls it back if [action] throws.
+  ///
+  /// Nested transactions are not supported for persistent databases.
   T transaction<T>(T Function(PureDatabase database) action) {
     if (_pager == null) {
       final before = _cloneTables(_tables);
@@ -614,7 +638,9 @@ class PureDatabase {
       table.nextRowId = rowId >= table.nextRowId ? rowId + 1 : table.nextRowId;
       table.rows.add(row);
       table.rowIds.add(rowId);
-      for (final index in table.indexes) _validateIndexRows(index, table.rows);
+      for (final index in table.indexes) {
+        _validateIndexRows(index, table.rows);
+      }
     } catch (_) {
       table.rows
         ..clear()
@@ -658,13 +684,15 @@ class PureDatabase {
       for (final column in table.columns) {
         if (column.unique || column.primaryKey) {
           final value = row[column.name];
-          if (value != null && _columnEqual(column, old[column.name], value))
+          if (value != null && _columnEqual(column, old[column.name], value)) {
             conflicts.add(index);
+          }
         }
       }
       for (final uniqueIndex in table.indexes) {
-        if (uniqueIndex.unique && _sameIndexKey(uniqueIndex, old, row))
+        if (uniqueIndex.unique && _sameIndexKey(uniqueIndex, old, row)) {
           conflicts.add(index);
+        }
       }
     }
     return conflicts.toList()..sort();
@@ -690,8 +718,9 @@ class PureDatabase {
     final pager = _pager!;
     final schemaRows = SqliteTableBtree.readTree(pager, 1, pageStart: 100);
     for (final schemaRow in schemaRows) {
-      if (schemaRow.values.length < 5 || schemaRow.values[0] != 'table')
+      if (schemaRow.values.length < 5 || schemaRow.values[0] != 'table') {
         continue;
+      }
       final sql = schemaRow.values[4];
       final rootPage = schemaRow.values[3];
       if (sql is! String || rootPage is! int) continue;
@@ -734,8 +763,9 @@ class PureDatabase {
       final sql = schemaRow.values[4];
       final rootPage = schemaRow.values[3];
       final tableName = schemaRow.values[2];
-      if (rootPage is! int || tableName is! String || indexName is! String)
+      if (rootPage is! int || tableName is! String || indexName is! String) {
         continue;
+      }
       final table = _tables[_key(tableName)];
       if (table == null) throw SqliteFormatException('index table is missing');
       _CreateIndex? statement;
@@ -793,6 +823,7 @@ class PureDatabase {
         : rows.map((row) => row.rowId).reduce((a, b) => a > b ? a : b) + 1;
   }
 
+  /// Rolls back any active transaction and releases the database resources.
   void close() {
     if (_inTransaction) _rollback();
     _pager?.close();
@@ -1266,26 +1297,36 @@ class PureDatabase {
   }
 }
 
+/// A row returned by the `sqlite3` compatibility facade.
 typedef Row = Map<String, Object?>;
+
+/// Rows returned by [Database.select].
 typedef ResultSet = List<Row>;
 
 /// Compatibility entry point for applications migrating from package:sqlite3.
 final sqlite3 = Sqlite();
 
+/// Opens databases through the `sqlite3.open` compatibility API.
 class Sqlite {
+  /// Opens or creates a persistent database at [path].
   Database open(String path) => Database._(PureDatabase.open(path));
 }
 
+/// Small synchronous compatibility facade for `package:sqlite3` call sites.
 class Database {
   Database._(this._database);
 
   final PureDatabase _database;
+
+  /// Number of rows changed by the most recent call to [execute].
   int updatedRows = 0;
 
+  /// Executes one supported SQL statement with positional [parameters].
   void execute(String sql, [List<Object?> parameters = const []]) {
     updatedRows = _database.execute(sql, parameters);
   }
 
+  /// Runs a `SELECT` or read-only `PRAGMA` and returns its rows.
   ResultSet select(String sql, [List<Object?> parameters = const []]) => [
     for (final row in _database.select(sql, parameters))
       {
@@ -1295,6 +1336,7 @@ class Database {
       },
   ];
 
+  /// Closes the database and releases its resources.
   void dispose() => _database.close();
 }
 
@@ -2030,8 +2072,9 @@ class _Tokenizer {
         result.add(_Token(_TokenType.number, sql.substring(start, _offset)));
       } else if (char == '?') {
         final start = _offset++;
-        while (_offset < sql.length && _isDigit(sql.codeUnitAt(_offset)))
+        while (_offset < sql.length && _isDigit(sql.codeUnitAt(_offset))) {
           _offset++;
+        }
         result.add(_Token(_TokenType.parameter, sql.substring(start, _offset)));
       } else {
         final two = _offset + 1 < sql.length
@@ -2118,7 +2161,9 @@ class _Parser {
         _expectWord('KEY');
         _expect('(');
         primaryKeyColumns.add(_identifier());
-        while (_accept(',')) primaryKeyColumns.add(_identifier());
+        while (_accept(',')) {
+          primaryKeyColumns.add(_identifier());
+        }
         _expect(')');
       } else if (_acceptWord('CHECK')) {
         checks.add(_checkExpression());
@@ -2298,13 +2343,17 @@ class _Parser {
     List<String>? columns;
     if (_accept('(')) {
       columns = [_identifier()];
-      while (_accept(',')) columns.add(_identifier());
+      while (_accept(',')) {
+        columns.add(_identifier());
+      }
       _expect(')');
     }
     _expectWord('VALUES');
     _expect('(');
     final values = [_expression()];
-    while (_accept(',')) values.add(_expression());
+    while (_accept(',')) {
+      values.add(_expression());
+    }
     _expect(')');
     return _Insert(table, columns, values, conflict: conflict);
   }
@@ -2357,7 +2406,9 @@ class _Parser {
     if (_acceptWord('GROUP')) {
       _expectWord('BY');
       groupBy.add(_expression());
-      while (_accept(',')) groupBy.add(_expression());
+      while (_accept(',')) {
+        groupBy.add(_expression());
+      }
     }
     final order = <_Order>[];
     if (_acceptWord('ORDER')) {
@@ -2428,13 +2479,17 @@ class _Parser {
 
   _Expr _or() {
     var result = _and();
-    while (_acceptWord('OR')) result = _Binary(result, 'OR', _and());
+    while (_acceptWord('OR')) {
+      result = _Binary(result, 'OR', _and());
+    }
     return result;
   }
 
   _Expr _and() {
     var result = _comparison();
-    while (_acceptWord('AND')) result = _Binary(result, 'AND', _comparison());
+    while (_acceptWord('AND')) {
+      result = _Binary(result, 'AND', _comparison());
+    }
     return result;
   }
 
@@ -2479,7 +2534,9 @@ class _Parser {
   List<_Expr> _inValues() {
     _expect('(');
     final values = <_Expr>[_expression()];
-    while (_accept(',')) values.add(_expression());
+    while (_accept(',')) {
+      values.add(_expression());
+    }
     _expect(')');
     return values;
   }
@@ -2506,12 +2563,13 @@ class _Parser {
       return _Param(index);
     }
     if (token.type == _TokenType.string) return _Literal(token.value);
-    if (token.type == _TokenType.number)
+    if (token.type == _TokenType.number) {
       return _Literal(
         token.text.contains('.')
             ? double.parse(token.text)
             : int.parse(token.text),
       );
+    }
     if (token.type == _TokenType.word) {
       final word = token.text.toUpperCase();
       if (word == 'CASE') {
@@ -2537,7 +2595,9 @@ class _Parser {
           arguments.add(_Column('*'));
         } else {
           arguments.add(_expression());
-          while (_accept(',')) arguments.add(_expression());
+          while (_accept(',')) {
+            arguments.add(_expression());
+          }
         }
         _expect(')');
         return _Function(token.text, arguments, distinct: distinct);
@@ -2559,24 +2619,28 @@ class _Parser {
 
   String _identifier() {
     final token = _advance();
-    if (token.type != _TokenType.word)
+    if (token.type != _TokenType.word) {
       throw PureSqlException('expected identifier');
+    }
     return token.text;
   }
 
   void _expect(String text) {
-    if (!_accept(text))
+    if (!_accept(text)) {
       throw PureSqlException('expected "$text", got "${_peek.text}"');
+    }
   }
 
   void _expectWord(String word) {
-    if (!_acceptWord(word))
+    if (!_acceptWord(word)) {
       throw PureSqlException('expected $word, got ${_peek.text}');
+    }
   }
 
   void _expectType(_TokenType type) {
-    if (_peek.type != type)
+    if (_peek.type != type) {
       throw PureSqlException('unexpected token: ${_peek.text}');
+    }
   }
 
   bool _accept(String text) {

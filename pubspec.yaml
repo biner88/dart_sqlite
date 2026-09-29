@@ -1,6 +1,6 @@
 name: dart_sqlite
 description: A pure-Dart SQLite-compatible engine and sqlite3 API replacement.
-version: 0.1.0
+version: 0.1.1
 homepage: https://github.com/biner88/dart_sqlite
 issue_tracker: https://github.com/biner88/dart_sqlite/issues
 

@@ -51,7 +51,9 @@ class SqliteIndexBtree {
     final existingChildren = _childPages(pager, rootPage);
     final pages = _pack(entries, pager.header.pageSize);
     if (pages.length == 1) {
-      for (final child in existingChildren) pager.freePage(child);
+      for (final child in existingChildren) {
+        pager.freePage(child);
+      }
       pager.writePage(rootPage, pages.single.page);
       return;
     }

@@ -8,16 +8,21 @@ const _legacyJournalMagic = 'PURE_SQLITE_JOURNAL_V1';
 const _rollbackJournalMagic = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
 const _journalSectorSize = 512;
 
+/// An error caused by malformed or unsupported SQLite file data.
 class SqliteFormatException implements Exception {
+  /// Creates an exception with a human-readable [message].
   SqliteFormatException(this.message);
 
+  /// The reason the SQLite data could not be read or written.
   final String message;
 
   @override
   String toString() => 'SqliteFormatException: $message';
 }
 
+/// The fields stored in the 100-byte header of a SQLite database file.
 class SqliteDatabaseHeader {
+  /// Creates a header with the supplied SQLite format values.
   SqliteDatabaseHeader({
     required this.pageSize,
     this.writeVersion = 1,
@@ -40,9 +45,11 @@ class SqliteDatabaseHeader {
     }
   }
 
+  /// Creates a new database header using SQLite's default format values.
   factory SqliteDatabaseHeader.create({int pageSize = 4096}) =>
       SqliteDatabaseHeader(pageSize: pageSize);
 
+  /// Parses a SQLite database header from its first 100 [bytes].
   factory SqliteDatabaseHeader.fromBytes(List<int> bytes) {
     if (bytes.length < 100) {
       throw SqliteFormatException('database header is shorter than 100 bytes');
@@ -91,6 +98,7 @@ class SqliteDatabaseHeader {
   int versionValidFor;
   int sqliteVersion;
 
+  /// Encodes this header into SQLite's 100-byte on-disk representation.
   Uint8List toBytes() {
     final bytes = Uint8List(100);
     bytes.setRange(0, 16, utf8.encode(_sqliteMagic));
@@ -224,8 +232,9 @@ class SqliteRecordCodec {
         offset += 8;
       } else if (type >= 12) {
         final length = (type - (type.isEven ? 12 : 13)) ~/ 2;
-        if (offset + length > bytes.length)
+        if (offset + length > bytes.length) {
           throw SqliteFormatException('truncated record value');
+        }
         final value = bytes.sublist(offset, offset + length);
         values.add(
           type.isEven ? Uint8List.fromList(value) : utf8.decode(value),
@@ -233,16 +242,18 @@ class SqliteRecordCodec {
         offset += length;
       } else if (type >= 1 && type <= 6) {
         final length = const [0, 1, 2, 3, 4, 6, 8][type];
-        if (offset + length > bytes.length)
+        if (offset + length > bytes.length) {
           throw SqliteFormatException('truncated integer value');
+        }
         values.add(_readSigned(bytes, offset, length));
         offset += length;
       } else {
         throw SqliteFormatException('reserved record serial type: $type');
       }
     }
-    if (offset != bytes.length)
+    if (offset != bytes.length) {
       throw SqliteFormatException('trailing record bytes');
+    }
     return values;
   }
 }
@@ -1281,8 +1292,9 @@ class SqliteWal {
       databaseSize: databaseSize,
     );
     final header = snapshot.header;
-    if (header == null)
+    if (header == null) {
       throw SqliteFormatException('missing SQLite WAL header');
+    }
     final salt1 = _readU32(header, 16);
     final salt2 = _readU32(header, 20);
     final littleEndianChecksum = _readU32(header, 0) == _magic;
@@ -1410,8 +1422,9 @@ List<int> _signedBytes(int value, int length) {
 
 int _readSigned(List<int> bytes, int offset, int length) {
   var value = 0;
-  for (var index = 0; index < length; index++)
+  for (var index = 0; index < length; index++) {
     value = value * 256 + bytes[offset + index];
+  }
   if (bytes[offset] & 0x80 != 0) value -= 1 << (length * 8);
   return value;
 }

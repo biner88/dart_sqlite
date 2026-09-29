@@ -62,7 +62,9 @@ class SqliteTableBtree {
     final existingChildren = _childPages(pager, rootPage, pageStart);
     final pages = _pack(rows, pager.header.pageSize, pager, pageStart);
     if (pages.length == 1) {
-      for (final child in existingChildren) pager.freePage(child);
+      for (final child in existingChildren) {
+        pager.freePage(child);
+      }
       pager.writePage(rootPage, pages.single);
       return;
     }
