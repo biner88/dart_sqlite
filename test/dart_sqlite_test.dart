@@ -356,6 +356,29 @@ void main() {
     updateConflictDb.select('SELECT * FROM update_conflict_children').isEmpty,
   );
 
+  updateConflictDb.execute(
+    "CREATE TABLE update_checks (id INTEGER PRIMARY KEY, value TEXT NOT NULL CHECK (value <> 'bad'))",
+  );
+  updateConflictDb.execute("INSERT INTO update_checks VALUES (1, 'good')");
+  assert(
+    updateConflictDb.execute(
+          'UPDATE OR IGNORE update_checks SET value = NULL WHERE id = 1',
+        ) ==
+        0,
+  );
+  assert(
+    updateConflictDb.execute(
+          "UPDATE OR IGNORE update_checks SET value = 'bad' WHERE id = 1",
+        ) ==
+        0,
+  );
+  assert(
+    updateConflictDb
+            .select('SELECT value FROM update_checks')
+            .single['value'] ==
+        'good',
+  );
+
   final disabledFkDb = PureDatabase.memory();
   disabledFkDb.execute('CREATE TABLE disabled_parent (id INTEGER PRIMARY KEY)');
   disabledFkDb.execute('''
@@ -372,6 +395,137 @@ void main() {
             .single['parent_id'] ==
         1,
   );
+
+  final renameDb = PureDatabase.memory();
+  renameDb.execute('''
+    CREATE TABLE old_parent (
+      id INTEGER PRIMARY KEY,
+      value TEXT,
+      external_key TEXT UNIQUE
+    )
+  ''');
+  renameDb.execute('''
+    CREATE TABLE old_child (
+      parent_id INTEGER REFERENCES old_parent(id) ON UPDATE CASCADE
+    )
+  ''');
+  renameDb.execute('CREATE INDEX old_parent_value_idx ON old_parent(value)');
+  renameDb.execute('''
+    CREATE VIEW old_parent_view AS
+      SELECT id, 'FROM old_parent' AS marker FROM old_parent
+  ''');
+  renameDb.execute('PRAGMA foreign_keys = ON');
+  renameDb.execute("INSERT INTO old_parent VALUES (1, 'value', 'key')");
+  renameDb.execute('INSERT INTO old_child VALUES (1)');
+  renameDb.execute('ALTER TABLE old_parent RENAME TO renamed_parent');
+  assert(renameDb.select('SELECT value FROM renamed_parent').length == 1);
+  assert(
+    renameDb.select('SELECT marker FROM old_parent_view').single['marker'] ==
+        'FROM old_parent',
+  );
+  assert(
+    renameDb.select('PRAGMA foreign_key_list(old_child)').single['table'] ==
+        'renamed_parent',
+  );
+  assert(
+    renameDb
+        .select('PRAGMA index_list(renamed_parent)')
+        .any((row) => row['name'] == 'old_parent_value_idx'),
+  );
+  renameDb.execute('UPDATE renamed_parent SET id = 2 WHERE id = 1');
+  assert(
+    renameDb.select('SELECT parent_id FROM old_child').single['parent_id'] == 2,
+  );
+  renameDb.execute('BEGIN');
+  final schemaVersionBeforeRollback = renameDb
+      .select('PRAGMA schema_version')
+      .single['schema_version'];
+  renameDb.execute('ALTER TABLE renamed_parent RENAME TO temporary_parent');
+  assert(
+    renameDb.select('PRAGMA schema_version').single['schema_version'] ==
+        (schemaVersionBeforeRollback as int) + 1,
+  );
+  renameDb.execute('ROLLBACK');
+  assert(
+    renameDb.select('PRAGMA schema_version').single['schema_version'] ==
+        schemaVersionBeforeRollback,
+  );
+  assert(renameDb.select('SELECT id FROM renamed_parent').single['id'] == 2);
+  assert(
+    renameDb
+        .select('PRAGMA index_list(renamed_parent)')
+        .any((row) => row['name'] == 'old_parent_value_idx'),
+  );
+
+  final renameColumnDb = PureDatabase.memory();
+  renameColumnDb.execute('''
+    CREATE TABLE rename_column_probe (
+      id INTEGER PRIMARY KEY,
+      "old value" TEXT,
+      note TEXT DEFAULT 'old value'
+    )
+  ''');
+  renameColumnDb.execute(
+    "INSERT INTO rename_column_probe VALUES (1, 'kept', NULL)",
+  );
+  renameColumnDb.execute('''
+    ALTER TABLE rename_column_probe RENAME COLUMN "old value" TO "new value"
+  ''');
+  assert(
+    renameColumnDb
+            .select('SELECT "new value", note FROM rename_column_probe')
+            .single['new value'] ==
+        'kept',
+  );
+  assert(
+    renameColumnDb.select(
+          'PRAGMA table_info(rename_column_probe)',
+        )[1]['name'] ==
+        'new value',
+  );
+  renameColumnDb.execute('BEGIN');
+  renameColumnDb.execute('''
+    ALTER TABLE rename_column_probe RENAME COLUMN "new value" TO rolled_back
+  ''');
+  renameColumnDb.execute('ROLLBACK');
+  assert(
+    renameColumnDb
+            .select('SELECT "new value" FROM rename_column_probe')
+            .single['new value'] ==
+        'kept',
+  );
+
+  final dropColumnDb = PureDatabase.memory();
+  dropColumnDb.execute('''
+    CREATE TABLE drop_column_probe (
+      id INTEGER PRIMARY KEY,
+      remove_me TEXT,
+      keep TEXT DEFAULT 'remove_me'
+    )
+  ''');
+  dropColumnDb.execute(
+    "INSERT INTO drop_column_probe VALUES (1, 'gone', 'kept')",
+  );
+  dropColumnDb.execute('ALTER TABLE drop_column_probe DROP COLUMN remove_me');
+  assert(
+    dropColumnDb
+            .select('SELECT id, keep FROM drop_column_probe')
+            .single['keep'] ==
+        'kept',
+  );
+  assert(
+    dropColumnDb
+            .select('PRAGMA table_info(drop_column_probe)')
+            .map((row) => row['name'])
+            .join(',') ==
+        'id,keep',
+  );
+  try {
+    dropColumnDb.execute('ALTER TABLE drop_column_probe DROP COLUMN id');
+    assert(false, 'dropping a primary-key column should fail');
+  } on PureSqlException {
+    // Expected.
+  }
 
   final joinDb = PureDatabase.memory();
   joinDb.execute('CREATE TABLE join_left (id INTEGER, label TEXT)');
@@ -621,6 +775,30 @@ void main() {
     compatible
         .select('PRAGMA pragma_list')
         .any((row) => row['name'] == 'freelist_count'),
+  );
+  assert(
+    compatible
+        .select('PRAGMA pragma_list')
+        .any((row) => row['name'] == 'schema_version'),
+  );
+  final initialSchemaVersion =
+      compatible.select('PRAGMA schema_version').single['schema_version']
+          as int;
+  compatible.execute('CREATE TABLE schema_version_probe (id INTEGER)');
+  assert(
+    compatible.select('PRAGMA schema_version').single['schema_version'] ==
+        initialSchemaVersion + 1,
+  );
+  compatible.execute(
+    'CREATE TABLE IF NOT EXISTS schema_version_probe (id INTEGER)',
+  );
+  assert(
+    compatible.select('PRAGMA schema_version').single['schema_version'] ==
+        initialSchemaVersion + 1,
+  );
+  compatible.execute('PRAGMA schema_version = 100');
+  assert(
+    compatible.select('PRAGMA schema_version').single['schema_version'] == 100,
   );
   compatible.execute('PRAGMA application_id = 1234');
   assert(

@@ -78,6 +78,7 @@ class PureDatabase {
   SqlitePagerSync? _pager;
   var _userVersion = 0;
   var _applicationId = 0;
+  var _schemaVersion = 1;
   var _foreignKeys = false;
   var _synchronous = 2;
   var _inTransaction = false;
@@ -85,6 +86,7 @@ class PureDatabase {
   SqliteRollbackJournal? _transactionJournal;
   Map<String, _Table>? _memoryTransactionTables;
   Map<String, _CreateView>? _memoryTransactionViews;
+  int? _memoryTransactionSchemaVersion;
 
   /// Executes one supported SQL statement with a positional list or named map.
   ///
@@ -117,10 +119,45 @@ class PureDatabase {
         statement.value != null) {
       return _changeJournalMode(statement, values);
     }
-    if (_pager != null && !_inTransaction && statement is! _Select) {
-      return _persistentWrite(() => _execute(statement, values, sql));
+    int run() {
+      final changesSchema = _changesSchema(statement);
+      final changed = _execute(statement, values, sql);
+      if (changesSchema) _incrementSchemaVersion();
+      return changed;
     }
-    return _execute(statement, values, sql);
+
+    if (_pager != null && !_inTransaction && statement is! _Select) {
+      return _persistentWrite(run);
+    }
+    return run();
+  }
+
+  bool _changesSchema(_Statement statement) => switch (statement) {
+    _CreateTable(:final name) => !_tables.containsKey(_key(name)),
+    _CreateView(:final name) =>
+      !_views.containsKey(_key(name)) &&
+          !_tables.containsKey(_key(name)) &&
+          !_indexes.containsKey(_key(name)),
+    _CreateIndex(:final name) => !_indexes.containsKey(_key(name)),
+    _RenameTable() || _RenameColumn() || _DropColumn() || _AlterTable() => true,
+    _Drop(:final type, :final name) => switch (type) {
+      'table' => _tables.containsKey(_key(name)),
+      'view' => _views.containsKey(_key(name)),
+      'index' => _indexes.containsKey(_key(name)),
+      _ => false,
+    },
+    _ => false,
+  };
+
+  void _incrementSchemaVersion() {
+    final pager = _pager;
+    if (pager == null) {
+      _schemaVersion = (_schemaVersion + 1) & 0xffffffff;
+      return;
+    }
+    pager.header.schemaCookie = (pager.header.schemaCookie + 1) & 0xffffffff;
+    _schemaVersion = pager.header.schemaCookie;
+    pager.writePage(1, pager.readPage(1));
   }
 
   /// Runs a `SELECT` or read-only `PRAGMA` and returns its rows.
@@ -148,10 +185,18 @@ class PureDatabase {
   T transaction<T>(T Function(PureDatabase database) action) {
     if (_pager == null) {
       final before = _cloneTables(_tables);
+      final beforeViews = Map<String, _CreateView>.of(_views);
+      final beforeSchemaVersion = _schemaVersion;
       try {
         return action(this);
       } catch (_) {
         _tables = before;
+        _views = beforeViews;
+        _indexes = {
+          for (final table in before.values)
+            for (final index in table.indexes) _key(index.name): index,
+        };
+        _schemaVersion = beforeSchemaVersion;
         rethrow;
       }
     }
@@ -176,6 +221,9 @@ class PureDatabase {
         _Drop() => _drop(statement),
         _CreateIndex() => _createIndex(statement, sql: sql),
         _Pragma() => _pragma(statement, values),
+        _RenameTable() => _renameTable(statement),
+        _RenameColumn() => _renameColumn(statement),
+        _DropColumn() => _dropColumn(statement),
         _AlterTable() => _alterTable(statement, sql: sql),
         _Begin() || _Commit() || _Rollback() => throw PureSqlException(
           'transaction control must use execute()',
@@ -191,6 +239,7 @@ class PureDatabase {
     if (_pager == null) {
       _memoryTransactionTables = _cloneTables(_tables);
       _memoryTransactionViews = Map.of(_views);
+      _memoryTransactionSchemaVersion = _schemaVersion;
     } else {
       final pager = _pager!;
       while (true) {
@@ -249,6 +298,7 @@ class PureDatabase {
       _transactionJournal = null;
       _memoryTransactionTables = null;
       _memoryTransactionViews = null;
+      _memoryTransactionSchemaVersion = null;
       _inTransaction = false;
       if (_walTransaction) {
         _pager?.releaseWalWriterLock();
@@ -265,6 +315,7 @@ class PureDatabase {
     if (_pager == null) {
       _tables = _memoryTransactionTables!;
       _views = _memoryTransactionViews!;
+      _schemaVersion = _memoryTransactionSchemaVersion!;
       _indexes = {
         for (final table in _tables.values)
           for (final index in table.indexes) _key(index.name): index,
@@ -272,9 +323,11 @@ class PureDatabase {
     } else if (_walTransaction) {
       try {
         _pager!.rollbackWalTransaction();
+        _refreshFile();
       } finally {
         _memoryTransactionTables = null;
         _memoryTransactionViews = null;
+        _memoryTransactionSchemaVersion = null;
         _inTransaction = false;
         _walTransaction = false;
         _pager!.releaseWalWriterLock();
@@ -290,12 +343,14 @@ class PureDatabase {
         _transactionJournal = null;
         _memoryTransactionTables = null;
         _memoryTransactionViews = null;
+        _memoryTransactionSchemaVersion = null;
         _inTransaction = false;
         _pager!.releaseExclusiveLock();
       }
     }
     _transactionJournal = null;
     _memoryTransactionTables = null;
+    _memoryTransactionSchemaVersion = null;
     _inTransaction = false;
     return 0;
   }
@@ -390,6 +445,7 @@ class PureDatabase {
     _pager!.refresh();
     _applicationId = _pager!.header.applicationId;
     _userVersion = _pager!.header.userVersion;
+    _schemaVersion = _pager!.header.schemaCookie;
     _tables = {};
     _indexes = {};
     _views = {};
@@ -505,6 +561,7 @@ class PureDatabase {
       if (statement.ifNotExists) return 0;
       throw PureSqlException('view already exists: ${statement.name}');
     }
+    statement.schemaSql = sql.trim();
     _views[key] = statement;
     final pager = _pager;
     if (pager != null) {
@@ -517,6 +574,333 @@ class PureDatabase {
       ], pageStart: 100);
     }
     return 0;
+  }
+
+  int _renameTable(_RenameTable statement) {
+    final oldKey = _key(statement.table);
+    final newKey = _key(statement.newName);
+    final table = _table(statement.table);
+    if (_tables.containsKey(newKey) ||
+        _indexes.containsKey(newKey) ||
+        _views.containsKey(newKey) ||
+        newKey.startsWith('sqlite_')) {
+      throw PureSqlException('table already exists: ${statement.newName}');
+    }
+    final oldName = table.name;
+    final oldSql = table.schemaSql;
+    if (oldSql == null) throw SqliteFormatException('missing table SQL');
+    final newSql = _renameSqlIdentifiersAfter(
+      _renameSqlIdentifiersAfter(oldSql, oldName, statement.newName, 'table'),
+      oldName,
+      statement.newName,
+      'references',
+    );
+    final renamedViews = <String, _CreateView>{};
+    for (final entry in _views.entries) {
+      final viewSql = entry.value.schemaSql;
+      if (viewSql == null) throw SqliteFormatException('missing view SQL');
+      final renamedSql = _renameSqlIdentifiersAfter(
+        viewSql,
+        oldName,
+        statement.newName,
+        'source',
+      );
+      if (renamedSql != viewSql) {
+        final parsed = _Parser(renamedSql).parse();
+        if (parsed is! _CreateView) {
+          throw SqliteFormatException('invalid view SQL');
+        }
+        parsed.schemaSql = renamedSql;
+        renamedViews[entry.key] = parsed;
+      }
+    }
+
+    final pager = _pager;
+    if (pager != null) {
+      final schemaRows = SqliteTableBtree.readTree(pager, 1, pageStart: 100);
+      final updatedRows = [
+        for (final row in schemaRows)
+          _renameSchemaRow(row, oldName, statement.newName, newSql),
+      ];
+      SqliteTableBtree.rewriteRows(pager, 1, updatedRows, pageStart: 100);
+    }
+
+    _tables.remove(oldKey);
+    table.name = statement.newName;
+    table.schemaSql = newSql;
+    _tables[newKey] = table;
+    final autoIndexPrefix = 'sqlite_autoindex_${oldName}_';
+    for (final index in table.indexes) {
+      if (!_key(index.name).startsWith(_key(autoIndexPrefix))) continue;
+      final suffix = index.name.substring(autoIndexPrefix.length);
+      _indexes.remove(_key(index.name));
+      index.name = 'sqlite_autoindex_${statement.newName}_$suffix';
+      _indexes[_key(index.name)] = index;
+    }
+    for (final other in _tables.values) {
+      final schemaSql = other.schemaSql;
+      if (schemaSql != null) {
+        other.schemaSql = _renameSqlIdentifiersAfter(
+          schemaSql,
+          oldName,
+          statement.newName,
+          'references',
+        );
+      }
+      for (final column in other.columns) {
+        if (column.referencesTable != null &&
+            _key(column.referencesTable!) == oldKey) {
+          column.referencesTable = statement.newName;
+        }
+      }
+      for (final foreignKey in other.foreignKeyConstraints) {
+        if (_key(foreignKey.table) == oldKey) {
+          foreignKey.table = statement.newName;
+        }
+      }
+    }
+    _views.addAll(renamedViews);
+    return 0;
+  }
+
+  int _renameColumn(_RenameColumn statement) {
+    final table = _table(statement.table);
+    final column = table.column(statement.oldName);
+    if (table.columns.any(
+      (other) => _key(other.name) == _key(statement.newName),
+    )) {
+      throw PureSqlException('duplicate column name: ${statement.newName}');
+    }
+    if (table.indexes.isNotEmpty ||
+        table.checkExpressions.isNotEmpty ||
+        table.uniqueConstraints.isNotEmpty ||
+        table.foreignKeyConstraints.isNotEmpty ||
+        table.columns.any(
+          (item) =>
+              item.checkExpressions.isNotEmpty || item.referencesTable != null,
+        )) {
+      throw PureSqlException(
+        'cannot rename a column with indexes, checks, or foreign keys',
+      );
+    }
+    for (final other in _tables.values) {
+      for (final foreignKey in _foreignKeysFor(other)) {
+        if (_key(foreignKey.table) == _key(table.name) &&
+            _referencedColumns(
+              foreignKey,
+              table,
+            ).any((name) => _key(name) == _key(column.name))) {
+          throw PureSqlException(
+            'cannot rename a column referenced by a foreign key',
+          );
+        }
+      }
+    }
+    for (final view in _views.values) {
+      final viewSql = view.schemaSql;
+      if (viewSql == null) throw SqliteFormatException('missing view SQL');
+      if (_renameSqlIdentifiersAfter(
+            viewSql,
+            table.name,
+            '__rename_probe__',
+            'source',
+          ) !=
+          viewSql) {
+        throw PureSqlException('cannot rename a column referenced by a view');
+      }
+    }
+    final oldSql = table.schemaSql;
+    if (oldSql == null) throw SqliteFormatException('missing table SQL');
+    final newSql = _renameSingleColumnToken(
+      oldSql,
+      table.name,
+      column.name,
+      statement.newName,
+    );
+    final parsed = _Parser(newSql).parse();
+    if (parsed is! _CreateTable ||
+        parsed.columns.length != table.columns.length) {
+      throw SqliteFormatException('invalid renamed CREATE TABLE SQL');
+    }
+    final before = _snapshotRows();
+    final oldColumns = List<_ColumnDef>.from(table.columns);
+    final oldColumnName = column.name;
+    try {
+      column.name = statement.newName;
+      for (final row in table.rows) {
+        final previous = Map<String, Object?>.from(row);
+        row
+          ..clear()
+          ..addAll({
+            for (final item in table.columns)
+              item.name:
+                  previous[_key(item.name) == _key(statement.newName)
+                      ? oldColumnName
+                      : item.name],
+          });
+      }
+      table.schemaSql = newSql;
+      final pager = _pager;
+      if (pager != null) {
+        _rewriteTable(pager, table);
+        final schemaRows = SqliteTableBtree.readTree(pager, 1, pageStart: 100);
+        SqliteTableBtree.rewriteRows(pager, 1, [
+          for (final row in schemaRows)
+            row.values.length >= 5 &&
+                    row.values[0] == 'table' &&
+                    _key(row.values[1].toString()) == _key(table.name)
+                ? SqliteBtreeRow(row.rowId, [...row.values]..[4] = newSql)
+                : row,
+        ], pageStart: 100);
+      }
+    } catch (_) {
+      column.name = oldColumnName;
+      table.columns
+        ..clear()
+        ..addAll(oldColumns);
+      table.schemaSql = oldSql;
+      _restoreRows(before);
+      rethrow;
+    }
+    return 0;
+  }
+
+  int _dropColumn(_DropColumn statement) {
+    final table = _table(statement.table);
+    final column = table.column(statement.name);
+    if (table.columns.length == 1 ||
+        table.rowIdColumn == column ||
+        table.indexes.isNotEmpty ||
+        table.primaryKeyColumns.isNotEmpty ||
+        table.checkExpressions.isNotEmpty ||
+        table.uniqueConstraints.isNotEmpty ||
+        table.foreignKeyConstraints.isNotEmpty ||
+        column.primaryKey ||
+        column.unique ||
+        column.checkExpressions.isNotEmpty ||
+        column.referencesTable != null) {
+      throw PureSqlException(
+        'cannot drop a column with indexes or constraints',
+      );
+    }
+    for (final child in _tables.values) {
+      for (final foreignKey in _foreignKeysFor(child)) {
+        if (_key(foreignKey.table) == _key(table.name) &&
+            _referencedColumns(
+              foreignKey,
+              table,
+            ).any((name) => _key(name) == _key(column.name))) {
+          throw PureSqlException(
+            'cannot drop a column referenced by a foreign key',
+          );
+        }
+      }
+    }
+    for (final view in _views.values) {
+      final viewSql = view.schemaSql;
+      if (viewSql == null) throw SqliteFormatException('missing view SQL');
+      if (_renameSqlIdentifiersAfter(
+            viewSql,
+            table.name,
+            '__drop_probe__',
+            'source',
+          ) !=
+          viewSql) {
+        throw PureSqlException('cannot drop a column referenced by a view');
+      }
+    }
+    final oldSql = table.schemaSql;
+    if (oldSql == null) throw SqliteFormatException('missing table SQL');
+    final newSql = _dropSingleColumnDefinition(oldSql, table.name, column.name);
+    final parsed = _Parser(newSql).parse();
+    if (parsed is! _CreateTable ||
+        parsed.columns.length != table.columns.length - 1) {
+      throw SqliteFormatException('invalid CREATE TABLE after DROP COLUMN');
+    }
+    final before = _snapshotRows();
+    final oldColumns = List<_ColumnDef>.from(table.columns);
+    try {
+      table.columns
+        ..clear()
+        ..addAll(parsed.columns);
+      for (final row in table.rows) {
+        row.remove(column.name);
+      }
+      table.schemaSql = newSql;
+      final pager = _pager;
+      if (pager != null) {
+        _rewriteTable(pager, table);
+        final schemaRows = SqliteTableBtree.readTree(pager, 1, pageStart: 100);
+        SqliteTableBtree.rewriteRows(pager, 1, [
+          for (final row in schemaRows)
+            row.values.length >= 5 &&
+                    row.values[0] == 'table' &&
+                    _key(row.values[1].toString()) == _key(table.name)
+                ? SqliteBtreeRow(row.rowId, [...row.values]..[4] = newSql)
+                : row,
+        ], pageStart: 100);
+      }
+    } catch (_) {
+      table.columns
+        ..clear()
+        ..addAll(oldColumns);
+      table.schemaSql = oldSql;
+      _restoreRows(before);
+      rethrow;
+    }
+    return 0;
+  }
+
+  SqliteBtreeRow _renameSchemaRow(
+    SqliteBtreeRow row,
+    String oldName,
+    String newName,
+    String renamedTableSql,
+  ) {
+    if (row.values.length < 5) return row;
+    final values = List<Object?>.from(row.values);
+    final type = values[0];
+    if (type == 'table' && values[4] is String) {
+      final rowName = values[1]?.toString() ?? '';
+      values[4] = _key(rowName) == _key(oldName)
+          ? renamedTableSql
+          : _renameSqlIdentifiersAfter(
+              values[4] as String,
+              oldName,
+              newName,
+              'references',
+            );
+      if (_key(rowName) == _key(oldName)) {
+        values[1] = newName;
+        values[2] = newName;
+      }
+    } else if (type == 'index' &&
+        _key(values[2]?.toString() ?? '') == _key(oldName)) {
+      values[2] = newName;
+      final indexName = values[1]?.toString() ?? '';
+      final autoIndexPrefix = 'sqlite_autoindex_${oldName}_';
+      if (_key(indexName).startsWith(_key(autoIndexPrefix))) {
+        values[1] =
+            'sqlite_autoindex_${newName}_'
+            '${indexName.substring(autoIndexPrefix.length)}';
+      }
+      if (values[4] is String) {
+        values[4] = _renameSqlIdentifiersAfter(
+          values[4] as String,
+          oldName,
+          newName,
+          'index',
+        );
+      }
+    } else if (type == 'view' && values[4] is String) {
+      values[4] = _renameSqlIdentifiersAfter(
+        values[4] as String,
+        oldName,
+        newName,
+        'source',
+      );
+    }
+    return SqliteBtreeRow(row.rowId, values);
   }
 
   int _alterTable(_AlterTable statement, {required String sql}) {
@@ -618,6 +1002,21 @@ class PureDatabase {
       }
       return 0;
     }
+    if (name == 'schema_version') {
+      final version = _asInt(value);
+      if (version < 0 || version > 0xffffffff) {
+        throw PureSqlException(
+          'schema_version must be an unsigned 32-bit integer',
+        );
+      }
+      _schemaVersion = version;
+      final pager = _pager;
+      if (pager != null) {
+        pager.header.schemaCookie = version;
+        pager.writePage(1, pager.readPage(1));
+      }
+      return 0;
+    }
     if (name != 'user_version') {
       throw PureSqlException('unsupported PRAGMA: ${statement.name}');
     }
@@ -648,6 +1047,9 @@ class PureDatabase {
     }
     if (name == 'application_id') {
       return _pager?.header.applicationId ?? _applicationId;
+    }
+    if (name == 'schema_version') {
+      return _pager?.header.schemaCookie ?? _schemaVersion;
     }
     if (name == 'encoding') return 'UTF-8';
     if (name == 'page_size') return _pager?.header.pageSize ?? 4096;
@@ -684,6 +1086,7 @@ class PureDatabase {
           'page_size',
           'pragma_list',
           'quick_check',
+          'schema_version',
           'synchronous',
           'table_info',
           'table_list',
@@ -1427,6 +1830,7 @@ class PureDatabase {
       }
       final statement = _Parser(schemaRow.values[4] as String).parse();
       if (statement is _CreateView) {
+        statement.schemaSql = schemaRow.values[4] as String;
         _views[_key(statement.name)] = statement;
       }
     }
@@ -2980,6 +3384,183 @@ Object? _pragmaInput(_Expr expression, List<Object?> parameters) =>
 
 String _key(String name) => name.toLowerCase();
 
+String _renameSqlIdentifiersAfter(
+  String sql,
+  String oldName,
+  String newName,
+  String context,
+) {
+  final tokens = _Tokenizer(sql).tokenize();
+  final targets = <_Token>[];
+  for (var index = 0; index < tokens.length - 1; index++) {
+    final token = tokens[index];
+    if (token.type != _TokenType.word || token.quoted) continue;
+    final keyword = token.text.toUpperCase();
+    var targetIndex = index + 1;
+    if (context == 'table') {
+      if (keyword != 'TABLE' ||
+          index == 0 ||
+          tokens[index - 1].text.toUpperCase() != 'CREATE') {
+        continue;
+      }
+      if (tokens[targetIndex].text.toUpperCase() == 'IF') targetIndex += 3;
+    } else if (context == 'index') {
+      if (keyword != 'ON') continue;
+    } else if (context == 'references') {
+      if (keyword != 'REFERENCES') continue;
+    } else if (context == 'source') {
+      if (keyword != 'FROM' && keyword != 'JOIN') continue;
+    }
+    if (targetIndex >= tokens.length) continue;
+    final target = tokens[targetIndex];
+    if (target.type == _TokenType.word && _key(target.text) == _key(oldName)) {
+      targets.add(target);
+    }
+    if (context == 'table' || context == 'index') break;
+  }
+  if (targets.isEmpty) return sql;
+  final quotedName = '"${newName.replaceAll('"', '""')}"';
+  final result = StringBuffer();
+  var offset = 0;
+  for (final target in targets) {
+    result
+      ..write(sql.substring(offset, target.start))
+      ..write(quotedName);
+    offset = target.end;
+  }
+  result.write(sql.substring(offset));
+  return result.toString();
+}
+
+String _renameSingleColumnToken(
+  String sql,
+  String tableName,
+  String oldName,
+  String newName,
+) {
+  final tokens = _Tokenizer(sql).tokenize();
+  var tableIndex = -1;
+  for (var index = 0; index < tokens.length - 1; index++) {
+    if (tokens[index].text.toUpperCase() != 'CREATE' ||
+        tokens[index + 1].text.toUpperCase() != 'TABLE') {
+      continue;
+    }
+    var nameIndex = index + 2;
+    if (tokens[nameIndex].text.toUpperCase() == 'IF') nameIndex += 3;
+    if (nameIndex < tokens.length &&
+        _key(tokens[nameIndex].text) == _key(tableName)) {
+      tableIndex = nameIndex;
+      break;
+    }
+  }
+  if (tableIndex < 0) throw SqliteFormatException('invalid CREATE TABLE SQL');
+  var openIndex = tableIndex + 1;
+  while (openIndex < tokens.length && tokens[openIndex].text != '(') {
+    openIndex++;
+  }
+  if (openIndex == tokens.length) {
+    throw SqliteFormatException('invalid CREATE TABLE SQL');
+  }
+  var depth = 0;
+  var closeIndex = -1;
+  final matches = <_Token>[];
+  for (var index = openIndex; index < tokens.length; index++) {
+    final token = tokens[index];
+    if (token.text == '(') depth++;
+    if (token.text == ')') {
+      depth--;
+      if (depth == 0) {
+        closeIndex = index;
+        break;
+      }
+    }
+    if (index > openIndex &&
+        token.type == _TokenType.word &&
+        _key(token.text) == _key(oldName)) {
+      matches.add(token);
+    }
+  }
+  if (closeIndex < 0 || matches.length != 1) {
+    throw PureSqlException('cannot safely rename column: $oldName');
+  }
+  final target = matches.single;
+  final quotedName = '"${newName.replaceAll('"', '""')}"';
+  return '${sql.substring(0, target.start)}$quotedName${sql.substring(target.end)}';
+}
+
+String _dropSingleColumnDefinition(
+  String sql,
+  String tableName,
+  String columnName,
+) {
+  final tokens = _Tokenizer(sql).tokenize();
+  var tableIndex = -1;
+  for (var index = 0; index < tokens.length - 1; index++) {
+    if (tokens[index].text.toUpperCase() != 'CREATE' ||
+        tokens[index + 1].text.toUpperCase() != 'TABLE') {
+      continue;
+    }
+    var nameIndex = index + 2;
+    if (tokens[nameIndex].text.toUpperCase() == 'IF') nameIndex += 3;
+    if (nameIndex < tokens.length &&
+        _key(tokens[nameIndex].text) == _key(tableName)) {
+      tableIndex = nameIndex;
+      break;
+    }
+  }
+  if (tableIndex < 0) throw SqliteFormatException('invalid CREATE TABLE SQL');
+  var openIndex = tableIndex + 1;
+  while (openIndex < tokens.length && tokens[openIndex].text != '(') {
+    openIndex++;
+  }
+  if (openIndex == tokens.length) {
+    throw SqliteFormatException('invalid CREATE TABLE SQL');
+  }
+  var depth = 1;
+  var closeIndex = -1;
+  final commas = <_Token>[];
+  for (var index = openIndex + 1; index < tokens.length; index++) {
+    final token = tokens[index];
+    if (token.text == '(') depth++;
+    if (token.text == ')') {
+      depth--;
+      if (depth == 0) {
+        closeIndex = index;
+        break;
+      }
+    } else if (token.text == ',' && depth == 1) {
+      commas.add(token);
+    }
+  }
+  if (closeIndex < 0 || commas.length == 0) {
+    throw PureSqlException('cannot drop the last column');
+  }
+  final starts = [tokens[openIndex].end, for (final comma in commas) comma.end];
+  final ends = [
+    for (final comma in commas) comma.start,
+    tokens[closeIndex].start,
+  ];
+  final matches = <int>[];
+  for (var segment = 0; segment < starts.length; segment++) {
+    final first = tokens.firstWhere(
+      (token) => token.start >= starts[segment] && token.end <= ends[segment],
+      orElse: () => tokens.last,
+    );
+    if (first.type == _TokenType.word && _key(first.text) == _key(columnName)) {
+      matches.add(segment);
+    }
+  }
+  if (matches.length != 1) {
+    throw PureSqlException('cannot safely drop column: $columnName');
+  }
+  final segment = matches.single;
+  final start = segment < commas.length
+      ? starts[segment]
+      : commas[segment - 1].start;
+  final end = segment < commas.length ? commas[segment].end : ends[segment];
+  return '${sql.substring(0, start)}${sql.substring(end)}';
+}
+
 bool _columnEqual(_ColumnDef column, Object? left, Object? right) =>
     column.collation == 'NOCASE' && left is String && right is String
     ? _sqliteNoCase(left) == _sqliteNoCase(right)
@@ -4394,7 +4975,7 @@ class _Table {
     this.foreignKeyConstraints = const [],
   });
 
-  final String name;
+  String name;
   final List<_ColumnDef> columns;
   final int? rootPage;
   final List<String> primaryKeyColumns;
@@ -4430,14 +5011,20 @@ class _Table {
   _Table copy() {
     final result = _Table(
       name,
-      List<_ColumnDef>.from(columns),
+      [for (final column in columns) column.copy()],
       rootPage: rootPage,
       schemaSql: schemaSql,
-      primaryKeyColumns: primaryKeyColumns,
-      checkExpressions: checkExpressions,
-      uniqueConstraints: uniqueConstraints,
-      foreignKeyConstraints: foreignKeyConstraints,
+      primaryKeyColumns: List<String>.from(primaryKeyColumns),
+      checkExpressions: List<_Expr>.from(checkExpressions),
+      uniqueConstraints: [
+        for (final constraint in uniqueConstraints)
+          List<String>.from(constraint),
+      ],
+      foreignKeyConstraints: [
+        for (final foreignKey in foreignKeyConstraints) foreignKey.copy(),
+      ],
     );
+    result.indexes.addAll([for (final index in indexes) index.copy(result)]);
     result.rows.addAll(rows.map((row) => Map<String, Object?>.from(row)));
     result.rowIds.addAll(rowIds);
     result.nextRowId = nextRowId;
@@ -4461,18 +5048,33 @@ class _ColumnDef {
     this.checkExpressions = const [],
   });
 
-  final String name;
+  String name;
   final String? typeName;
   final bool notNull;
   final bool primaryKey;
   final bool unique;
   final _Expr? defaultExpression;
-  final String? referencesTable;
+  String? referencesTable;
   final String? referencesColumn;
   final String onDelete;
   final String onUpdate;
   final String? collation;
   final List<_Expr> checkExpressions;
+
+  _ColumnDef copy() => _ColumnDef(
+    name,
+    typeName: typeName,
+    notNull: notNull,
+    primaryKey: primaryKey,
+    unique: unique,
+    defaultExpression: defaultExpression,
+    referencesTable: referencesTable,
+    referencesColumn: referencesColumn,
+    onDelete: onDelete,
+    onUpdate: onUpdate,
+    collation: collation,
+    checkExpressions: List<_Expr>.from(checkExpressions),
+  );
 }
 
 class _ForeignKey {
@@ -4484,10 +5086,18 @@ class _ForeignKey {
     this.onUpdate = 'NO ACTION',
   });
   final List<String> columns;
-  final String table;
+  String table;
   final List<String> referencedColumns;
   final String onDelete;
   final String onUpdate;
+
+  _ForeignKey copy() => _ForeignKey(
+    List<String>.from(columns),
+    table,
+    List<String>.from(referencedColumns),
+    onDelete: onDelete,
+    onUpdate: onUpdate,
+  );
 }
 
 class _Index {
@@ -4501,13 +5111,23 @@ class _Index {
     this.where,
   });
 
-  final String name;
+  String name;
   final _Table table;
   final List<String> columns;
   int? rootPage;
   final bool unique;
   final List<bool> descending;
   final _Expr? where;
+
+  _Index copy(_Table table) => _Index(
+    name,
+    table,
+    List<String>.from(columns),
+    rootPage: rootPage,
+    unique: unique,
+    descending: List<bool>.from(descending),
+    where: where,
+  );
 }
 
 sealed class _Statement {}
@@ -4545,6 +5165,7 @@ class _CreateView extends _Statement {
   final _Select query;
   final bool ifNotExists;
   final List<String>? columns;
+  String? schemaSql;
 }
 
 class _CreateIndex extends _Statement {
@@ -4574,6 +5195,28 @@ class _AlterTable extends _Statement {
   final _ColumnDef column;
 }
 
+class _RenameTable extends _Statement {
+  _RenameTable(this.table, this.newName);
+
+  final String table;
+  final String newName;
+}
+
+class _RenameColumn extends _Statement {
+  _RenameColumn(this.table, this.oldName, this.newName);
+
+  final String table;
+  final String oldName;
+  final String newName;
+}
+
+class _DropColumn extends _Statement {
+  _DropColumn(this.table, this.name);
+
+  final String table;
+  final String name;
+}
+
 class _Begin extends _Statement {}
 
 class _Commit extends _Statement {}
@@ -4583,7 +5226,7 @@ class _Rollback extends _Statement {}
 class _Pragma extends _Statement {
   _Pragma(this.name, this.value, {this.argument});
 
-  final String name;
+  String name;
   final _Expr? value;
   final _Expr? argument;
 }
@@ -4864,12 +5507,22 @@ List<String> _splitSqlStatements(String sql) {
 }
 
 class _Token {
-  _Token(this.type, this.text, [this.value]) : quoted = false;
-  _Token.quoted(this.type, this.text) : value = null, quoted = true;
+  _Token.positioned(
+    this.type,
+    this.text, {
+    this.value,
+    this.start = -1,
+    this.end = -1,
+  }) : quoted = false;
+  _Token.quoted(this.type, this.text, {this.start = -1, this.end = -1})
+    : value = null,
+      quoted = true;
   final _TokenType type;
   final String text;
   final Object? value;
   final bool quoted;
+  final int start;
+  final int end;
 }
 
 class _Tokenizer {
@@ -4880,6 +5533,7 @@ class _Tokenizer {
   List<_Token> tokenize() {
     final result = <_Token>[];
     while (_offset < sql.length) {
+      final start = _offset;
       final code = sql.codeUnitAt(_offset);
       if (code <= 32) {
         _offset++;
@@ -4898,33 +5552,63 @@ class _Tokenizer {
       }
       final char = sql[_offset];
       if (char == "'") {
-        result.add(_Token(_TokenType.string, char, _string()));
+        final value = _string();
+        result.add(
+          _Token.positioned(
+            _TokenType.string,
+            char,
+            value: value,
+            start: start,
+            end: _offset,
+          ),
+        );
       } else if (char == '"' || char == '`' || char == '[') {
-        result.add(_Token.quoted(_TokenType.word, _quotedIdentifier(char)));
+        final value = _quotedIdentifier(char);
+        result.add(
+          _Token.quoted(_TokenType.word, value, start: start, end: _offset),
+        );
       } else if (_isLetter(_codePointAt(_offset)) || char == '_') {
-        final start = _offset;
         _offset += _codePointWidthAt(_offset);
         while (_offset < sql.length &&
             (_isLetterOrDigit(_codePointAt(_offset)) || sql[_offset] == '_')) {
           _offset += _codePointWidthAt(_offset);
         }
-        result.add(_Token(_TokenType.word, sql.substring(start, _offset)));
+        result.add(
+          _Token.positioned(
+            _TokenType.word,
+            sql.substring(start, _offset),
+            start: start,
+            end: _offset,
+          ),
+        );
       } else if (_isDigit(code)) {
-        final start = _offset++;
+        _offset++;
         while (_offset < sql.length &&
             (_isDigit(sql.codeUnitAt(_offset)) || sql[_offset] == '.')) {
           _offset++;
         }
-        result.add(_Token(_TokenType.number, sql.substring(start, _offset)));
+        result.add(
+          _Token.positioned(
+            _TokenType.number,
+            sql.substring(start, _offset),
+            start: start,
+            end: _offset,
+          ),
+        );
       } else if (char == '?' || char == ':' || char == '@' || char == r'$') {
-        final start = _offset++;
+        _offset++;
         while (_offset < sql.length &&
             (_isLetterOrDigit(_codePointAt(_offset)) || sql[_offset] == '_')) {
           _offset += _codePointWidthAt(_offset);
         }
         if (char == '?' || _offset > start + 1) {
           result.add(
-            _Token(_TokenType.parameter, sql.substring(start, _offset)),
+            _Token.positioned(
+              _TokenType.parameter,
+              sql.substring(start, _offset),
+              start: start,
+              end: _offset,
+            ),
           );
         } else {
           throw PureSqlException('parameter name is missing');
@@ -4934,17 +5618,33 @@ class _Tokenizer {
             ? sql.substring(_offset, _offset + 2)
             : '';
         if (const ['<=', '>=', '<>', '!=', '||', '<<', '>>'].contains(two)) {
-          result.add(_Token(_TokenType.symbol, two));
+          result.add(
+            _Token.positioned(
+              _TokenType.symbol,
+              two,
+              start: start,
+              end: start + 2,
+            ),
+          );
           _offset += 2;
         } else if ('(),=*<>+-/%|&~^;.'.contains(char)) {
-          result.add(_Token(_TokenType.symbol, char));
+          result.add(
+            _Token.positioned(
+              _TokenType.symbol,
+              char,
+              start: start,
+              end: start + 1,
+            ),
+          );
           _offset++;
         } else {
           throw PureSqlException('unexpected character: $char');
         }
       }
     }
-    result.add(_Token(_TokenType.eof, ''));
+    result.add(
+      _Token.positioned(_TokenType.eof, '', start: sql.length, end: sql.length),
+    );
     return result;
   }
 
@@ -5385,6 +6085,19 @@ class _Parser {
     _expectWord('ALTER');
     _expectWord('TABLE');
     final table = _identifier();
+    if (_acceptWord('RENAME')) {
+      if (_acceptWord('COLUMN')) {
+        final oldName = _identifier();
+        _expectWord('TO');
+        return _RenameColumn(table, oldName, _identifier());
+      }
+      _expectWord('TO');
+      return _RenameTable(table, _identifier());
+    }
+    if (_acceptWord('DROP')) {
+      _expectWord('COLUMN');
+      return _DropColumn(table, _identifier());
+    }
     _expectWord('ADD');
     _acceptWord('COLUMN');
     final name = _identifier();

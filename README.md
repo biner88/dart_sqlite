@@ -61,7 +61,7 @@ optional.
 
 | Area | Supported subset |
 | --- | --- |
-| DDL | `CREATE TABLE [IF NOT EXISTS]`; `CREATE VIEW [IF NOT EXISTS]` with optional output-column names; `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` on columns, including partial indexes; `DROP TABLE` / `DROP VIEW` / `DROP INDEX [IF EXISTS]`; `ALTER TABLE ... ADD [COLUMN]` with declared types, `NOT NULL`, and literal `DEFAULT` |
+| DDL | `CREATE TABLE [IF NOT EXISTS]`; `CREATE VIEW [IF NOT EXISTS]` with optional output-column names; `CREATE [UNIQUE] INDEX [IF NOT EXISTS]` on columns, including partial indexes; `DROP TABLE` / `DROP VIEW` / `DROP INDEX [IF EXISTS]`; `ALTER TABLE ... ADD [COLUMN]` with declared types, `NOT NULL`, and literal `DEFAULT`; `ALTER TABLE ... RENAME TO`; and dependency-free `ALTER TABLE ... RENAME COLUMN` / `DROP COLUMN` |
 | DML | Multi-row `INSERT [OR IGNORE\|REPLACE] INTO ... VALUES (...)`, `DEFAULT VALUES`, and `INSERT ... SELECT`; UPSERT `ON CONFLICT (...) DO NOTHING` or `DO UPDATE SET ... [WHERE ...]`; `UPDATE [OR ABORT\|IGNORE\|REPLACE] ... SET ... [WHERE ...]`; `DELETE FROM ... [WHERE ...]` |
 | Query | `SELECT` with or without `FROM`, derived tables in `FROM` and joins, non-recursive `WITH` CTEs, `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`, `DISTINCT`, `AS` aliases, `WHERE`, inner/left/right/full/cross/natural joins with `ON` or `USING`, `GROUP BY`, `HAVING`, expression/ordinal `ORDER BY`, `LIMIT`, and `OFFSET`; `*` and qualified columns are supported |
 | Schema constraints | Column `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, literal `DEFAULT`, `CHECK`, and `REFERENCES`; table-level primary key, unique, foreign key, and `CHECK` constraints; foreign-key `ON DELETE` / `ON UPDATE` actions `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, and `SET DEFAULT` |
@@ -81,12 +81,12 @@ Expressions support literals, column references, parentheses, searched `CASE`, u
 
 ### Supported PRAGMAs
 
-Read/write settings: `application_id`, `user_version`, `foreign_keys`, `busy_timeout`, `synchronous`, and `journal_mode` (`DELETE` / `WAL` for persistent databases; in-memory reports `memory`). Read-only inspection includes `integrity_check`, `quick_check`, `table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `foreign_key_check`, `database_list`, `table_list`, `collation_list`, `function_list`, `pragma_list`, `encoding`, `page_size`, `page_count`, `freelist_count`, and `auto_vacuum`.
+Read/write settings: `application_id`, `schema_version`, `user_version`, `foreign_keys`, `busy_timeout`, `synchronous`, and `journal_mode` (`DELETE` / `WAL` for persistent databases; in-memory reports `memory`). Read-only inspection includes `integrity_check`, `quick_check`, `table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `foreign_key_check`, `database_list`, `table_list`, `collation_list`, `function_list`, `pragma_list`, `encoding`, `page_size`, `page_count`, `freelist_count`, and `auto_vacuum`.
 
 ## Not supported
 
 - Full SQLite grammar: recursive CTEs, window functions, and DML `RETURNING`.
-- Other DDL: rename/drop-column forms of `ALTER TABLE`, triggers, virtual tables, and `AUTOINCREMENT` sequence persistence.
+- Other DDL: triggers, virtual tables, and `AUTOINCREMENT` sequence persistence. Column rename/drop are limited to tables without indexes, constraints, foreign-key references, or dependent views.
 - Other DML: `UPDATE OR FAIL` / `OR ROLLBACK` and `UPDATE` / `DELETE ... RETURNING`. UPSERT supports one conflict clause with column-only targets; target predicates and multiple clauses are not supported.
 - Other expression syntax: row values and `RAISE()`. A named-parameter map cannot bind positional placeholders; use one binding style per statement.
 - SQL functions and PRAGMAs not listed above. SQLite's extension, loadable-function, virtual-table, and compile-option ecosystem is intentionally not implied by these lists.

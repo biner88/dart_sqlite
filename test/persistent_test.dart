@@ -29,8 +29,15 @@ Future<void> main(List<String> args) async {
   assert(database.select('PRAGMA user_version').single['user_version'] == 0);
   database.execute('PRAGMA user_version = 7');
   database.execute('PRAGMA application_id = 1234');
+  database.execute('PRAGMA schema_version = 40');
   assert(database.select('PRAGMA user_version').single['user_version'] == 7);
+  assert(
+    database.select('PRAGMA schema_version').single['schema_version'] == 40,
+  );
   database.execute('CREATE TABLE folders (id TEXT PRIMARY KEY)');
+  assert(
+    database.select('PRAGMA schema_version').single['schema_version'] == 41,
+  );
   database.execute(
     'CREATE TABLE files (id TEXT PRIMARY KEY, folder_id TEXT NOT NULL REFERENCES folders(id))',
   );
@@ -54,6 +61,41 @@ Future<void> main(List<String> args) async {
   ''');
   database.execute("INSERT INTO composite_parent VALUES ('a', 'b')");
   database.execute("INSERT INTO composite_child VALUES ('a', 'b')");
+  database.execute('''
+    CREATE TABLE before_rename (id INTEGER PRIMARY KEY, value TEXT UNIQUE)
+  ''');
+  database.execute('''
+    CREATE TABLE rename_reference (
+      parent_id INTEGER REFERENCES before_rename(id) ON UPDATE CASCADE
+    )
+  ''');
+  database.execute(
+    'CREATE INDEX before_rename_value_idx ON before_rename(value)',
+  );
+  database.execute('''
+    CREATE VIEW renamed_view AS
+      SELECT 'FROM before_rename' AS marker, value FROM before_rename
+  ''');
+  database.execute("INSERT INTO before_rename VALUES (1, 'kept')");
+  database.execute('INSERT INTO rename_reference VALUES (1)');
+  database.execute('ALTER TABLE before_rename RENAME TO after_rename');
+  database.execute('UPDATE after_rename SET id = 2 WHERE id = 1');
+  database.execute(
+    'CREATE TABLE persistent_column_rename (id INTEGER PRIMARY KEY, old_name TEXT)',
+  );
+  database.execute(
+    "INSERT INTO persistent_column_rename VALUES (1, 'survives reopen')",
+  );
+  database.execute(
+    'ALTER TABLE persistent_column_rename RENAME COLUMN old_name TO new_name',
+  );
+  database.execute(
+    'CREATE TABLE persistent_drop_column (id INTEGER PRIMARY KEY, remove_me TEXT, keep TEXT)',
+  );
+  database.execute(
+    "INSERT INTO persistent_drop_column VALUES (1, 'gone', 'kept')",
+  );
+  database.execute('ALTER TABLE persistent_drop_column DROP COLUMN remove_me');
   database.execute('''
     CREATE TABLE upsert_parent (id INTEGER PRIMARY KEY, token TEXT UNIQUE)
   ''');
@@ -127,10 +169,17 @@ Future<void> main(List<String> args) async {
     CREATE VIEW first_users(user_id, display_name) AS
       SELECT id, name FROM users WHERE id < 3
   ''');
+  final expectedSchemaVersion = database
+      .select('PRAGMA schema_version')
+      .single['schema_version'];
   database.close();
 
   final reopened = PureDatabase.open(path);
   assert(reopened.select('PRAGMA user_version').single['user_version'] == 7);
+  assert(
+    reopened.select('PRAGMA schema_version').single['schema_version'] ==
+        expectedSchemaVersion,
+  );
   assert(
     reopened.select('PRAGMA application_id').single['application_id'] == 1234,
   );
@@ -138,6 +187,39 @@ Future<void> main(List<String> args) async {
     reopened.select('PRAGMA foreign_key_list(composite_child)').length == 2,
   );
   assert(reopened.select('SELECT * FROM composite_child').length == 1);
+  assert(
+    reopened
+            .select('SELECT marker, value FROM renamed_view')
+            .single['marker'] ==
+        'FROM before_rename',
+  );
+  assert(
+    reopened
+            .select('PRAGMA foreign_key_list(rename_reference)')
+            .single['table'] ==
+        'after_rename',
+  );
+  assert(
+    reopened
+        .select('PRAGMA index_list(after_rename)')
+        .any((row) => row['name'] == 'before_rename_value_idx'),
+  );
+  assert(
+    reopened
+            .select('SELECT parent_id FROM rename_reference')
+            .single['parent_id'] ==
+        2,
+  );
+  assert(
+    reopened
+            .select('SELECT new_name FROM persistent_column_rename')
+            .single['new_name'] ==
+        'survives reopen',
+  );
+  assert(
+    reopened.select('SELECT keep FROM persistent_drop_column').single['keep'] ==
+        'kept',
+  );
   assert(reopened.select('SELECT id FROM upsert_parent').single['id'] == 2);
   assert(
     reopened.select('SELECT parent_id FROM upsert_child').single['parent_id'] ==
