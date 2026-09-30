@@ -3,10 +3,11 @@ import 'dart:typed_data';
 import 'sqlite_format.dart';
 
 class SqliteBtreeRow {
-  SqliteBtreeRow(this.rowId, this.values);
+  SqliteBtreeRow(this.rowId, this.values, {this.recordOffset});
 
   final int rowId;
   final List<Object?> values;
+  final int? recordOffset;
 }
 
 class SqliteTableBtree {
@@ -22,6 +23,7 @@ class SqliteTableBtree {
         pager.header.pageSize,
         pageStart: pageStart,
         pager: pager,
+        pageNumber: rootPage,
       );
     }
     if (page[pageStart] != 0x05) {
@@ -36,7 +38,12 @@ class SqliteTableBtree {
     children.add(_readU32(page, pageStart + 8));
     return [
       for (final child in children)
-        ...readPage(pager.readPage(child), pager.header.pageSize, pager: pager),
+        ...readPage(
+          pager.readPage(child),
+          pager.header.pageSize,
+          pager: pager,
+          pageNumber: child,
+        ),
     ];
   }
 
@@ -175,6 +182,7 @@ class SqliteTableBtree {
     int pageSize, {
     int pageStart = 0,
     SqlitePagerSync? pager,
+    int? pageNumber,
   }) {
     if (page[pageStart] != 0x0d) {
       throw SqliteFormatException('expected a table leaf B-tree page');
@@ -193,7 +201,15 @@ class SqliteTableBtree {
       );
       final start = pointer + payloadHeaderLength + rowIdLength;
       final payload = _readPayload(page, pageSize, start, payloadLength, pager);
-      rows.add(SqliteBtreeRow(rowId, SqliteRecordCodec.decode(payload)));
+      rows.add(
+        SqliteBtreeRow(
+          rowId,
+          SqliteRecordCodec.decode(payload),
+          recordOffset: pageNumber == null
+              ? null
+              : (pageNumber - 1) * pageSize + start,
+        ),
+      );
     }
     return rows;
   }

@@ -20,6 +20,20 @@ class SqliteFormatException implements Exception {
   String toString() => 'SqliteFormatException: $message';
 }
 
+/// An error raised when a database cannot grow within its configured limit.
+class SqliteDatabaseFullException implements Exception {
+  /// Creates the standard SQLite full-database error.
+  const SqliteDatabaseFullException([
+    this.message = 'database or disk is full',
+  ]);
+
+  /// The reason the database could not grow.
+  final String message;
+
+  @override
+  String toString() => 'SqliteDatabaseFullException: $message';
+}
+
 /// The fields stored in the 100-byte header of a SQLite database file.
 class SqliteDatabaseHeader {
   /// Creates a header with the supplied SQLite format values.
@@ -34,6 +48,7 @@ class SqliteDatabaseHeader {
     this.schemaCookie = 1,
     this.schemaFormat = 4,
     this.textEncoding = 1,
+    this.defaultCacheSize = 0,
     this.userVersion = 0,
     this.applicationId = 0,
     this.versionValidFor = 0,
@@ -71,6 +86,7 @@ class SqliteDatabaseHeader {
       databaseSizeInPages: _readU32(bytes, 28),
       schemaCookie: _readU32(bytes, 40),
       schemaFormat: _readU32(bytes, 44),
+      defaultCacheSize: _readU32(bytes, 48),
       textEncoding: _readU32(bytes, 56),
       userVersion: _readU32(bytes, 60),
       applicationId: _readU32(bytes, 68),
@@ -92,6 +108,7 @@ class SqliteDatabaseHeader {
   int databaseSizeInPages;
   int schemaCookie;
   int schemaFormat;
+  int defaultCacheSize;
   int textEncoding;
   int userVersion;
   int applicationId;
@@ -115,6 +132,7 @@ class SqliteDatabaseHeader {
     _writeU32(bytes, 36, freelistPageCount);
     _writeU32(bytes, 40, schemaCookie);
     _writeU32(bytes, 44, schemaFormat);
+    _writeU32(bytes, 48, defaultCacheSize);
     _writeU32(bytes, 56, textEncoding);
     _writeU32(bytes, 60, userVersion);
     _writeU32(bytes, 68, applicationId);
@@ -336,15 +354,40 @@ class SqlitePager {
   }
 }
 
+/// A pager snapshot used to undo one statement inside an active transaction.
+class SqlitePagerSavepoint {
+  SqlitePagerSavepoint._({
+    required this.walMode,
+    required this.pageCount,
+    required this.headerBytes,
+    this.databaseBytes,
+    this.walPages,
+  });
+
+  final bool walMode;
+  final int pageCount;
+  final Uint8List headerBytes;
+  final Uint8List? databaseBytes;
+  final Map<int, Uint8List>? walPages;
+}
+
 /// Synchronous VM pager used by the current synchronous database API.
 class SqlitePagerSync {
+  /// SQLite's default and format-level maximum database page count.
+  static const defaultMaxPageCount = 0xfffffffe;
+
+  /// Whether [pageSize] is a supported SQLite database page size.
+  static bool isValidPageSize(int pageSize) => _isValidSqlitePageSize(pageSize);
+
   SqlitePagerSync._(
     this._path,
     this.header,
     this._pageCount,
     this._databaseFile,
-    this._busyTimeout,
-  ) : _walMode = header.writeVersion == 2 && header.readVersion == 2;
+    this._busyTimeout, {
+    bool newDatabase = false,
+  }) : _newDatabase = newDatabase,
+       _walMode = header.writeVersion == 2 && header.readVersion == 2;
 
   final String _path;
   SqliteDatabaseHeader header;
@@ -357,6 +400,11 @@ class SqlitePagerSync {
   }
 
   int _pageCount;
+  int _maxPageCount = defaultMaxPageCount;
+  int synchronous = 2;
+  int walAutoCheckpointPages = 1000;
+  int journalSizeLimit = -1;
+  bool _newDatabase;
   bool _walMode;
   SqliteWalSnapshot? _walSnapshot;
   Map<int, Uint8List>? _pendingWalPages;
@@ -420,6 +468,7 @@ class SqlitePagerSync {
             1,
             databaseFile,
             busyTimeout,
+            newDatabase: true,
           );
         }
         final header = SqliteDatabaseHeader.fromBytes(bytes.sublist(0, 100));
@@ -461,11 +510,103 @@ class SqlitePagerSync {
 
   int get pageCount => _pageCount;
 
+  int get maxPageCount => _maxPageCount;
+  set maxPageCount(int value) {
+    if (value <= 0) return;
+    final bounded = value > defaultMaxPageCount ? defaultMaxPageCount : value;
+    _maxPageCount = bounded < _pageCount ? _pageCount : bounded;
+  }
+
+  void setPageSize(int pageSize) {
+    if (!isValidPageSize(pageSize) ||
+        pageSize == header.pageSize ||
+        _walMode ||
+        _pageCount != 1 ||
+        !_newDatabase) {
+      return;
+    }
+    final firstPage = readPage(1);
+    if (_readU16(firstPage, 103) != 0) return;
+    final resizedPage = Uint8List(pageSize);
+    final copiedLength = pageSize < firstPage.length
+        ? pageSize
+        : firstPage.length;
+    resizedPage.setRange(0, copiedLength, firstPage);
+    header.pageSize = pageSize;
+    resizedPage.setRange(0, 100, header.toBytes());
+    _databaseFile.writeAll(resizedPage, flush: synchronous >= 2);
+  }
+
+  void resetForVacuum() {
+    if (_walMode && _pendingWalPages == null) {
+      throw StateError('VACUUM requires an active WAL transaction');
+    }
+    final previous = header;
+    header = SqliteDatabaseHeader(
+      pageSize: previous.pageSize,
+      writeVersion: previous.writeVersion,
+      readVersion: previous.readVersion,
+      schemaCookie: previous.schemaCookie,
+      schemaFormat: previous.schemaFormat,
+      defaultCacheSize: previous.defaultCacheSize,
+      textEncoding: previous.textEncoding,
+      userVersion: previous.userVersion,
+      applicationId: previous.applicationId,
+      versionValidFor: previous.versionValidFor,
+      sqliteVersion: previous.sqliteVersion,
+    );
+    _pageCount = 1;
+    _newDatabase = false;
+    final firstPage = Uint8List(header.pageSize)
+      ..setRange(0, 100, header.toBytes())
+      ..[100] = 0x0d;
+    _writeU16(firstPage, 105, header.pageSize == 65536 ? 0 : header.pageSize);
+    if (_walMode) {
+      _pendingWalPages!
+        ..clear()
+        ..[1] = firstPage;
+    } else {
+      _databaseFile.writeAll(firstPage, flush: synchronous >= 2);
+    }
+  }
+
+  void resetForVacuumFrom(SqliteDatabaseHeader source) {
+    if (_walMode || _pendingWalPages != null) {
+      throw StateError(
+        'VACUUM INTO destination must use rollback-journal mode',
+      );
+    }
+    final previous = source;
+    header = SqliteDatabaseHeader(
+      pageSize: header.pageSize,
+      writeVersion: 1,
+      readVersion: 1,
+      schemaCookie: previous.schemaCookie,
+      schemaFormat: previous.schemaFormat,
+      defaultCacheSize: previous.defaultCacheSize,
+      textEncoding: previous.textEncoding,
+      userVersion: previous.userVersion,
+      applicationId: previous.applicationId,
+      versionValidFor: previous.versionValidFor,
+      sqliteVersion: previous.sqliteVersion,
+    );
+    _walMode = false;
+    _pageCount = 1;
+    _newDatabase = false;
+    final firstPage = Uint8List(header.pageSize)
+      ..setRange(0, 100, header.toBytes())
+      ..[100] = 0x0d;
+    _writeU16(firstPage, 105, header.pageSize == 65536 ? 0 : header.pageSize);
+    _databaseFile.writeAll(firstPage, flush: synchronous >= 2);
+  }
+
   bool get isWalMode => _walMode;
 
   String get path => _path;
 
   RandomAccessFile get databaseHandle => _databaseFile.handle;
+
+  void syncDatabase() => _databaseFile.flush();
 
   Uint8List readPage(int pageNumber) {
     _checkPage(pageNumber);
@@ -476,6 +617,52 @@ class SqlitePagerSync {
     final bytes = _databaseFile.readAll();
     final start = (pageNumber - 1) * header.pageSize;
     return Uint8List.fromList(bytes.sublist(start, start + header.pageSize));
+  }
+
+  SqlitePagerSavepoint createSavepoint() {
+    if (_walMode) {
+      final pending = _pendingWalPages;
+      if (pending == null) throw StateError('no WAL transaction is active');
+      return SqlitePagerSavepoint._(
+        walMode: true,
+        pageCount: _pageCount,
+        headerBytes: Uint8List.fromList(header.toBytes()),
+        walPages: {
+          for (final entry in pending.entries)
+            entry.key: Uint8List.fromList(entry.value),
+        },
+      );
+    }
+    // ponytail: rollback-mode snapshots copy the whole DB; page deltas if measured costly.
+    return SqlitePagerSavepoint._(
+      walMode: false,
+      pageCount: _pageCount,
+      headerBytes: Uint8List.fromList(header.toBytes()),
+      databaseBytes: _databaseFile.readAll(),
+    );
+  }
+
+  void rollbackToSavepoint(SqlitePagerSavepoint savepoint) {
+    if (savepoint.walMode) {
+      if (!_walMode || _pendingWalPages == null || savepoint.walPages == null) {
+        throw StateError('savepoint does not belong to the active transaction');
+      }
+      _pendingWalPages = {
+        for (final entry in savepoint.walPages!.entries)
+          entry.key: Uint8List.fromList(entry.value),
+      };
+      _pageCount = savepoint.pageCount;
+      header = SqliteDatabaseHeader.fromBytes(savepoint.headerBytes);
+      header.databaseSizeInPages = _pageCount;
+      return;
+    }
+    if (_walMode || savepoint.databaseBytes == null) {
+      throw StateError('savepoint does not belong to the active transaction');
+    }
+    _databaseFile.writeAll(savepoint.databaseBytes!, flush: synchronous > 0);
+    header = SqliteDatabaseHeader.fromBytes(savepoint.headerBytes);
+    _pageCount = savepoint.pageCount;
+    header.databaseSizeInPages = _pageCount;
   }
 
   void refresh() {
@@ -508,18 +695,20 @@ class SqlitePagerSync {
       header.databaseSizeInPages = _pageCount;
       _walSnapshot = snapshot;
       _walMode = true;
+      _newDatabase = false;
     } else {
       header = diskHeader;
       _pageCount = diskHeader.databaseSizeInPages;
       _walSnapshot = null;
       _walMode = false;
+      _checkNewDatabase(bytes, diskHeader);
     }
   }
 
-  void acquireWalWriterLock() {
+  void acquireWalWriterLock({Duration? timeout}) {
     if (!_walMode) throw StateError('WAL writer lock requires WAL mode');
     if (_hasWalWriterLock) return;
-    _databaseFile.acquireWalWriter(this, busyTimeout);
+    _databaseFile.acquireWalWriter(this, timeout ?? busyTimeout);
     _hasWalWriterLock = true;
   }
 
@@ -548,10 +737,118 @@ class SqlitePagerSync {
       pageSize: header.pageSize,
       databaseSize: _pageCount,
       pages: pending,
+      flush: synchronous >= 2,
     );
     _pendingWalPages = null;
     refresh();
+    if (walAutoCheckpointPages > 0 && walFrameCount >= walAutoCheckpointPages) {
+      checkpointWal('PASSIVE');
+    }
   }
+
+  int get walFrameCount {
+    if (!_walMode) return -1;
+    return _walFrames(
+      SqliteWal.read(
+        _path,
+        pageSize: header.pageSize,
+        databaseSize: header.databaseSizeInPages,
+      ),
+    );
+  }
+
+  (int busy, int log, int checkpointed) checkpointWal(String mode) {
+    if (!_walMode) return (0, -1, -1);
+    if (mode == 'NOOP') {
+      return withSharedLock(() {
+        final snapshot = SqliteWal.read(
+          _path,
+          pageSize: header.pageSize,
+          databaseSize: header.databaseSizeInPages,
+        );
+        return (0, _walFrames(snapshot), 0);
+      });
+    }
+
+    final passive = mode == 'PASSIVE';
+    final timeout = passive ? Duration.zero : busyTimeout;
+    final heldWalWriter = _hasWalWriterLock;
+    var acquiredWalWriter = false;
+    try {
+      if (_pendingWalPages != null) {
+        return (passive ? 0 : 1, walFrameCount, 0);
+      }
+      if (!heldWalWriter) {
+        acquireWalWriterLock(timeout: timeout);
+        acquiredWalWriter = true;
+      }
+      return withExclusiveLock(
+        () => _checkpointWalLocked(mode),
+        timeout: timeout,
+      );
+    } on SqliteFormatException catch (error) {
+      if (!error.message.startsWith('database is locked:')) rethrow;
+      return (passive ? 0 : 1, walFrameCount, 0);
+    } finally {
+      if (acquiredWalWriter) releaseWalWriterLock();
+    }
+  }
+
+  (int busy, int log, int checkpointed) _checkpointWalLocked(String mode) {
+    final snapshot = SqliteWal.read(
+      _path,
+      pageSize: header.pageSize,
+      databaseSize: header.databaseSizeInPages,
+    );
+    final frameCount = _walFrames(snapshot);
+    if (snapshot.header == null) return (0, 0, 0);
+    if (frameCount <= 0) {
+      if (mode == 'TRUNCATE' || journalSizeLimit >= 0) {
+        SqliteWal.reset(
+          _path,
+          header.pageSize,
+          truncate: mode == 'TRUNCATE',
+          sizeLimit: journalSizeLimit,
+          flush: synchronous > 0,
+        );
+        refresh();
+      }
+      return (0, frameCount, 0);
+    }
+
+    final pageCount = snapshot.databaseSize;
+    final original = _databaseFile.readAll();
+    final database = Uint8List(pageCount * header.pageSize);
+    database.setRange(0, min(original.length, database.length), original);
+    for (final entry in snapshot.pages.entries) {
+      final start = (entry.key - 1) * header.pageSize;
+      database.setRange(start, start + header.pageSize, entry.value);
+    }
+    final nextHeader = SqliteDatabaseHeader.fromBytes(database.sublist(0, 100))
+      ..databaseSizeInPages = pageCount;
+    nextHeader
+      ..writeVersion = 2
+      ..readVersion = 2;
+    database.setRange(0, 100, nextHeader.toBytes());
+
+    // Keep the WAL as the redo source until the checkpointed database flushes.
+    if (synchronous > 0) SqliteWal.sync(_path);
+    _databaseFile.writeAll(database, flush: synchronous > 0);
+    SqliteWal.reset(
+      _path,
+      header.pageSize,
+      truncate: mode == 'TRUNCATE',
+      sizeLimit: journalSizeLimit,
+      flush: synchronous > 0,
+    );
+    refresh();
+    if (mode == 'TRUNCATE') return (0, 0, 0);
+    return (0, frameCount, frameCount);
+  }
+
+  int _walFrames(SqliteWalSnapshot snapshot) => snapshot.header == null
+      ? 0
+      : (snapshot.validLength - 32) ~/ (24 + header.pageSize);
 
   void rollbackWalTransaction() {
     if (_pendingWalPages == null) return;
@@ -565,8 +862,9 @@ class SqlitePagerSync {
     header
       ..writeVersion = 2
       ..readVersion = 2;
+    _newDatabase = false;
     pageOne.setRange(0, 100, header.toBytes());
-    SqliteWal.initialize(_path, header.pageSize);
+    SqliteWal.initialize(_path, header.pageSize, flush: synchronous > 0);
     _writePage(1, pageOne);
     refresh();
   }
@@ -581,6 +879,7 @@ class SqlitePagerSync {
     final journal = SqliteRollbackJournal.begin(
       _path,
       databaseHandle: databaseHandle,
+      flush: synchronous > 0,
     );
     try {
       final pageCount = snapshot.databaseSize;
@@ -598,7 +897,8 @@ class SqlitePagerSync {
         ..writeVersion = 1
         ..readVersion = 1;
       database.setRange(0, 100, nextHeader.toBytes());
-      _databaseFile.writeAll(database);
+      _databaseFile.writeAll(database, flush: synchronous >= 2);
+      if (synchronous == 1) syncDatabase();
       journal.commit();
       final wal = File(SqliteWal.pathFor(_path));
       if (wal.existsSync()) wal.deleteSync();
@@ -610,13 +910,13 @@ class SqlitePagerSync {
     }
   }
 
-  T withExclusiveLock<T>(T Function() action) {
+  T withExclusiveLock<T>(T Function() action, {Duration? timeout}) {
     if (_closed) throw StateError('database pager is closed');
     if (_hasExclusiveLock) return action();
     if (_hasSharedLock) {
       throw StateError('cannot upgrade a shared lock on this connection');
     }
-    acquireExclusiveLock();
+    acquireExclusiveLock(timeout: timeout);
     try {
       return action();
     } finally {
@@ -624,12 +924,12 @@ class SqlitePagerSync {
     }
   }
 
-  void acquireExclusiveLock() {
+  void acquireExclusiveLock({Duration? timeout}) {
     if (_closed) throw StateError('database pager is closed');
     if (_hasExclusiveLock) {
       throw StateError('database lock is already held by this connection');
     }
-    _databaseFile.acquireExclusive(this, busyTimeout);
+    _databaseFile.acquireExclusive(this, timeout ?? busyTimeout);
     _hasExclusiveLock = true;
   }
 
@@ -683,6 +983,9 @@ class SqlitePagerSync {
       writePage(trunkPage, Uint8List(header.pageSize));
       return trunkPage;
     }
+    if (_pageCount >= _maxPageCount) {
+      throw const SqliteDatabaseFullException();
+    }
     _pageCount++;
     header.databaseSizeInPages = _pageCount;
     writePage(_pageCount, Uint8List(header.pageSize));
@@ -722,6 +1025,7 @@ class SqlitePagerSync {
     if (pageNumber < 1 || bytes.length != header.pageSize) {
       throw SqliteFormatException('page write has invalid size or number');
     }
+    _newDatabase = false;
     if (pageNumber > _pageCount) _pageCount = pageNumber;
     header.databaseSizeInPages = _pageCount;
     if (_walMode) {
@@ -748,6 +1052,24 @@ class SqlitePagerSync {
     _closed = true;
   }
 
+  void _checkNewDatabase(Uint8List bytes, SqliteDatabaseHeader diskHeader) {
+    if (!_newDatabase) return;
+    if (_pageCount != 1 ||
+        diskHeader.writeVersion != 1 ||
+        diskHeader.readVersion != 1 ||
+        diskHeader.schemaCookie != 1 ||
+        diskHeader.schemaFormat != 4 ||
+        diskHeader.defaultCacheSize != 0 ||
+        diskHeader.textEncoding != 1 ||
+        diskHeader.userVersion != 0 ||
+        diskHeader.applicationId != 0 ||
+        diskHeader.firstFreelistTrunkPage != 0 ||
+        diskHeader.freelistPageCount != 0 ||
+        _readU16(bytes, 103) != 0) {
+      _newDatabase = false;
+    }
+  }
+
   void _writePage(int pageNumber, List<int> bytes) {
     final old = _databaseFile.readAll();
     final all = Uint8List(_pageCount * header.pageSize);
@@ -758,7 +1080,7 @@ class SqlitePagerSync {
       bytes,
     );
     all.setRange(0, 100, header.toBytes());
-    _databaseFile.writeAll(all);
+    _databaseFile.writeAll(all, flush: synchronous >= 2);
   }
 
   void _checkPage(int pageNumber) {
@@ -790,13 +1112,15 @@ class _DatabaseFile {
     return Uint8List.fromList(length == 0 ? const [] : handle.readSync(length));
   }
 
-  void writeAll(List<int> bytes) {
+  void writeAll(List<int> bytes, {bool flush = true}) {
     handle
       ..truncateSync(0)
       ..setPositionSync(0)
-      ..writeFromSync(bytes)
-      ..flushSync();
+      ..writeFromSync(bytes);
+    if (flush) handle.flushSync();
   }
+
+  void flush() => handle.flushSync();
 
   void acquireShared(Object owner, Duration timeout) =>
       _acquire(owner, timeout, exclusive: false);
@@ -926,33 +1250,75 @@ class _DatabaseFile {
 }
 
 class SqliteRollbackJournal {
-  SqliteRollbackJournal._(this._path);
+  SqliteRollbackJournal._(
+    this._path, {
+    String mode = 'delete',
+    Uint8List? memorySnapshot,
+    bool flush = true,
+    int sizeLimit = -1,
+  }) : _mode = mode,
+       _memorySnapshot = memorySnapshot,
+       _flush = flush,
+       _sizeLimit = sizeLimit;
 
   final String _path;
+  final String _mode;
+  final Uint8List? _memorySnapshot;
+  final bool _flush;
+  final int _sizeLimit;
 
   static SqliteRollbackJournal begin(
     String databasePath, {
     RandomAccessFile? databaseHandle,
+    String mode = 'delete',
+    bool flush = true,
+    int sizeLimit = -1,
   }) {
+    final normalizedMode = mode.toLowerCase();
+    if (!const [
+      'delete',
+      'truncate',
+      'persist',
+      'memory',
+      'off',
+    ].contains(normalizedMode)) {
+      throw SqliteFormatException('unsupported rollback journal mode: $mode');
+    }
+    final original = databaseHandle == null
+        ? File(databasePath).readAsBytesSync()
+        : _readAll(databaseHandle);
+    if (original.length < 100) {
+      throw SqliteFormatException('database is shorter than its header');
+    }
+    final databaseHeader = SqliteDatabaseHeader.fromBytes(
+      original.sublist(0, 100),
+    );
+    final pageSize = databaseHeader.pageSize;
+    if (original.length % pageSize != 0 ||
+        original.length ~/ pageSize != databaseHeader.databaseSizeInPages) {
+      throw SqliteFormatException('database size does not match its header');
+    }
     final path = _journalPath(databasePath);
-    final file = File(path);
-    file.createSync(exclusive: true);
-    final journal = file.openSync(mode: FileMode.append);
-    try {
-      final original = databaseHandle == null
-          ? File(databasePath).readAsBytesSync()
-          : _readAll(databaseHandle);
-      if (original.length < 100) {
-        throw SqliteFormatException('database is shorter than its header');
-      }
-      final databaseHeader = SqliteDatabaseHeader.fromBytes(
-        original.sublist(0, 100),
+    if (normalizedMode == 'memory' || normalizedMode == 'off') {
+      // ponytail: MEMORY/OFF copy the whole database; page deltas if memory pressure warrants it.
+      return SqliteRollbackJournal._(
+        path,
+        mode: normalizedMode,
+        memorySnapshot: Uint8List.fromList(original),
+        flush: flush,
+        sizeLimit: sizeLimit,
       );
-      final pageSize = databaseHeader.pageSize;
-      if (original.length % pageSize != 0 ||
-          original.length ~/ pageSize != databaseHeader.databaseSizeInPages) {
-        throw SqliteFormatException('database size does not match its header');
+    }
+    final file = File(path);
+    if (file.existsSync()) {
+      final existing = file.readAsBytesSync();
+      if (existing.length > _journalSectorSize &&
+          !_journalHeaderIsZero(existing)) {
+        throw SqliteFormatException('rollback journal is already active');
       }
+    }
+    final journal = file.openSync(mode: FileMode.write);
+    try {
       final pageCount = databaseHeader.databaseSizeInPages;
       final nonce = Random.secure().nextInt(0x100000000);
       final header = Uint8List(_journalSectorSize);
@@ -978,22 +1344,37 @@ class SqliteRollbackJournal {
           ..writeFromSync(page)
           ..writeFromSync(checksum);
       }
-      journal.flushSync();
+      if (flush) journal.flushSync();
     } catch (_) {
       journal.closeSync();
       if (file.existsSync()) file.deleteSync();
       rethrow;
     }
     journal.closeSync();
-    return SqliteRollbackJournal._(path);
+    return SqliteRollbackJournal._(
+      path,
+      mode: normalizedMode,
+      flush: flush,
+      sizeLimit: sizeLimit,
+    );
   }
 
-  static void recover(String databasePath, {RandomAccessFile? databaseHandle}) {
+  static void recover(
+    String databasePath, {
+    RandomAccessFile? databaseHandle,
+    String journalMode = 'delete',
+    bool flush = true,
+    int sizeLimit = -1,
+  }) {
     _recoverLegacyJournal(databasePath, databaseHandle);
     final file = File(_journalPath(databasePath));
     if (!file.existsSync()) return;
     final bytes = file.readAsBytesSync();
     if (bytes.length <= _journalSectorSize) {
+      file.deleteSync();
+      return;
+    }
+    if (_journalHeaderIsZero(bytes)) {
       file.deleteSync();
       return;
     }
@@ -1093,7 +1474,7 @@ class SqliteRollbackJournal {
     } else {
       _writeAll(databaseHandle, restored);
     }
-    file.deleteSync();
+    _finishJournal(file.path, journalMode, flush: flush, sizeLimit: sizeLimit);
   }
 
   static void _recoverLegacyJournal(
@@ -1120,15 +1501,76 @@ class SqliteRollbackJournal {
     file.deleteSync();
   }
 
-  void commit() {
-    final file = File(_path);
-    if (file.existsSync()) file.deleteSync();
+  void commit({int? sizeLimit}) {
+    if (_mode == 'memory' || _mode == 'off') return;
+    _finishJournal(
+      _path,
+      _mode,
+      flush: _flush,
+      sizeLimit: sizeLimit ?? _sizeLimit,
+    );
   }
 
-  void rollback(String databasePath, {RandomAccessFile? databaseHandle}) {
-    recover(databasePath, databaseHandle: databaseHandle);
+  static void _finishJournal(
+    String path,
+    String mode, {
+    bool flush = true,
+    int sizeLimit = -1,
+  }) {
+    final file = File(path);
+    if (!file.existsSync()) return;
+    switch (mode) {
+      case 'truncate':
+        final journal = file.openSync(mode: FileMode.write);
+        try {
+          if (flush) journal.flushSync();
+        } finally {
+          journal.closeSync();
+        }
+      case 'persist':
+        final journal = file.openSync(mode: FileMode.append);
+        try {
+          final retainedLength = sizeLimit < 0
+              ? file.lengthSync()
+              : min(file.lengthSync(), sizeLimit);
+          journal.truncateSync(retainedLength);
+          journal
+            ..setPositionSync(0)
+            ..writeFromSync(Uint8List(min(8, retainedLength)));
+          if (flush) journal.flushSync();
+        } finally {
+          journal.closeSync();
+        }
+      default:
+        file.deleteSync();
+    }
+  }
+
+  void rollback(
+    String databasePath, {
+    RandomAccessFile? databaseHandle,
+    int? sizeLimit,
+  }) {
+    if (_memorySnapshot case final snapshot?) {
+      if (databaseHandle == null) {
+        File(databasePath).writeAsBytesSync(snapshot, flush: _flush);
+      } else {
+        _writeAll(databaseHandle, snapshot, flush: _flush);
+      }
+      return;
+    }
+    recover(
+      databasePath,
+      databaseHandle: databaseHandle,
+      journalMode: _mode,
+      flush: _flush,
+      sizeLimit: sizeLimit ?? _sizeLimit,
+    );
   }
 }
+
+bool _journalHeaderIsZero(List<int> bytes) =>
+    bytes.length >= 8 && bytes.take(8).every((byte) => byte == 0);
 
 class SqliteWalSnapshot {
   const SqliteWalSnapshot({
@@ -1157,6 +1599,17 @@ class SqliteWal {
   static const _version = 3007000;
 
   static String pathFor(String databasePath) => '$databasePath-wal';
+
+  static void sync(String databasePath) {
+    final file = File(pathFor(databasePath));
+    if (!file.existsSync()) return;
+    final wal = file.openSync(mode: FileMode.append);
+    try {
+      wal.flushSync();
+    } finally {
+      wal.closeSync();
+    }
+  }
 
   static SqliteWalSnapshot read(
     String databasePath, {
@@ -1257,7 +1710,11 @@ class SqliteWal {
     );
   }
 
-  static void initialize(String databasePath, int pageSize) {
+  static void initialize(
+    String databasePath,
+    int pageSize, {
+    bool flush = true,
+  }) {
     final header = Uint8List(32);
     final random = Random.secure();
     final salt1 = random.nextInt(0x100000000);
@@ -1272,7 +1729,41 @@ class SqliteWal {
     final checksum = _checksum(header, 0, 24, (0, 0), littleEndian: true);
     _writeU32(header, 24, checksum.$1);
     _writeU32(header, 28, checksum.$2);
-    File(pathFor(databasePath)).writeAsBytesSync(header, flush: true);
+    File(pathFor(databasePath)).writeAsBytesSync(header, flush: flush);
+  }
+
+  static void reset(
+    String databasePath,
+    int pageSize, {
+    required bool truncate,
+    int sizeLimit = -1,
+    bool flush = true,
+  }) {
+    final path = pathFor(databasePath);
+    final file = File(path);
+    final previousLength = file.existsSync() ? file.lengthSync() : 0;
+    final retainedLength = sizeLimit < 0
+        ? previousLength
+        : min(previousLength, sizeLimit);
+    if (truncate || retainedLength < 32) {
+      file.writeAsBytesSync(const [], flush: flush);
+      return;
+    }
+    initialize(databasePath, pageSize, flush: flush);
+    var remaining = retainedLength - 32;
+    if (remaining <= 0) return;
+    final wal = file.openSync(mode: FileMode.append);
+    final zeros = Uint8List(min(remaining, 64 * 1024));
+    try {
+      while (remaining > 0) {
+        final count = min(remaining, zeros.length);
+        wal.writeFromSync(zeros, 0, count);
+        remaining -= count;
+      }
+      if (flush) wal.flushSync();
+    } finally {
+      wal.closeSync();
+    }
   }
 
   static void append(
@@ -1280,11 +1771,12 @@ class SqliteWal {
     required int pageSize,
     required int databaseSize,
     required Map<int, Uint8List> pages,
+    bool flush = true,
   }) {
     if (pages.isEmpty) return;
     final path = pathFor(databasePath);
     if (!File(path).existsSync() || File(path).lengthSync() == 0) {
-      initialize(databasePath, pageSize);
+      initialize(databasePath, pageSize, flush: flush);
     }
     final snapshot = read(
       databasePath,
@@ -1331,8 +1823,8 @@ class SqliteWal {
       wal
         ..truncateSync(snapshot.validLength)
         ..setPositionSync(snapshot.validLength)
-        ..writeFromSync(frames.takeBytes())
-        ..flushSync();
+        ..writeFromSync(frames.takeBytes());
+      if (flush) wal.flushSync();
     } finally {
       wal.closeSync();
     }
@@ -1366,12 +1858,12 @@ Uint8List _readAll(RandomAccessFile handle) {
   return Uint8List.fromList(length == 0 ? const [] : handle.readSync(length));
 }
 
-void _writeAll(RandomAccessFile handle, List<int> bytes) {
+void _writeAll(RandomAccessFile handle, List<int> bytes, {bool flush = true}) {
   handle
     ..truncateSync(0)
     ..setPositionSync(0)
-    ..writeFromSync(bytes)
-    ..flushSync();
+    ..writeFromSync(bytes);
+  if (flush) handle.flushSync();
 }
 
 (int, List<int>) _encodeValue(Object? value) {
@@ -1436,11 +1928,14 @@ double _readDouble(List<int> bytes, int offset) => ByteData.sublistView(
 ).getFloat64(0, Endian.big);
 
 void _validatePageSize(int pageSize) {
-  if (pageSize != 65536 &&
-      (pageSize < 512 || pageSize > 32768 || pageSize & (pageSize - 1) != 0)) {
+  if (!_isValidSqlitePageSize(pageSize)) {
     throw SqliteFormatException('invalid SQLite page size: $pageSize');
   }
 }
+
+bool _isValidSqlitePageSize(int pageSize) =>
+    pageSize == 65536 ||
+    pageSize >= 512 && pageSize <= 32768 && pageSize & (pageSize - 1) == 0;
 
 int _readU16(List<int> bytes, int offset) =>
     bytes[offset] << 8 | bytes[offset + 1];
