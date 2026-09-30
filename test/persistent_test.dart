@@ -16,6 +16,28 @@ Future<void> main(List<String> args) async {
     database.close();
     return;
   }
+  if (args.length == 3 && args.first == '--hold-multi-write') {
+    final mainPath = args[1];
+    final attachedPath = args[2];
+    final database = PureDatabase.open(mainPath)
+      ..execute('ATTACH DATABASE ? AS aux', [attachedPath])
+      ..execute('BEGIN IMMEDIATE')
+      ..execute("UPDATE journal_probe SET value = 'after-main'")
+      ..execute("UPDATE aux.journal_probe SET value = 'after-aux'");
+    final master = SqliteRollbackJournal.createSuperJournal(mainPath, [
+      '$mainPath-journal',
+      '$attachedPath-journal',
+    ]);
+    SqliteRollbackJournal.setSuperJournalAt('$mainPath-journal', master.path);
+    SqliteRollbackJournal.setSuperJournalAt(
+      '$attachedPath-journal',
+      master.path,
+    );
+    stdout.writeln('READY');
+    await stdout.flush();
+    stdin.readLineSync();
+    exit(0); // Simulate process death without closing open database handles.
+  }
 
   final directory = Directory.systemTemp.createTempSync('dart_sqlite_db_');
   final path = '${directory.path}/data.sqlite';
@@ -2490,6 +2512,125 @@ Future<void> main(List<String> args) async {
   assert(sqliteCheck.exitCode == 0, sqliteCheck.stderr);
   assert(sqliteCheck.stdout.trim() == 'ok\nbefore', sqliteCheck.stdout);
   assert(!nativeJournal.existsSync(), 'SQLite should remove a hot journal');
+
+  final atomicMainPath = '${directory.path}/atomic-main.sqlite';
+  final atomicAttachedPath = '${directory.path}/atomic-attached.sqlite';
+  for (final atomicPath in [atomicMainPath, atomicAttachedPath]) {
+    PureDatabase.open(atomicPath)
+      ..execute('CREATE TABLE journal_probe (value TEXT)')
+      ..execute("INSERT INTO journal_probe VALUES ('before')")
+      ..close();
+  }
+  final atomicDatabase = PureDatabase.open(atomicMainPath)
+    ..execute('ATTACH DATABASE ? AS aux', [atomicAttachedPath])
+    ..execute('BEGIN IMMEDIATE')
+    ..execute("UPDATE main.journal_probe SET value = 'committed-main'")
+    ..execute("UPDATE aux.journal_probe SET value = 'committed-aux'")
+    ..execute('COMMIT');
+  assert(
+    atomicDatabase.select('SELECT value FROM journal_probe').single['value'] ==
+        'committed-main',
+  );
+  assert(
+    atomicDatabase
+            .select('SELECT value FROM aux.journal_probe')
+            .single['value'] ==
+        'committed-aux',
+  );
+  atomicDatabase.close();
+  assert(
+    Directory(directory.path)
+        .listSync()
+        .where((entity) => entity.path.contains('atomic-main.sqlite-mj'))
+        .isEmpty,
+    'successful attached commit cleans its super-journal',
+  );
+
+  final atomicCrashMainPath = '${directory.path}/atomic-crash-main.sqlite';
+  final atomicCrashAttachedPath =
+      '${directory.path}/atomic-crash-attached.sqlite';
+  for (final atomicPath in [atomicCrashMainPath, atomicCrashAttachedPath]) {
+    PureDatabase.open(atomicPath)
+      ..execute('CREATE TABLE journal_probe (value TEXT)')
+      ..execute("INSERT INTO journal_probe VALUES ('before')")
+      ..close();
+  }
+  final atomicWriter = await Process.start(Platform.resolvedExecutable, [
+    Platform.script.toFilePath(),
+    '--hold-multi-write',
+    atomicCrashMainPath,
+    atomicCrashAttachedPath,
+  ]);
+  final atomicReady = await atomicWriter.stdout
+      .transform(utf8.decoder)
+      .transform(const LineSplitter())
+      .first
+      .timeout(const Duration(seconds: 5));
+  assert(atomicReady == 'READY');
+  final nativeRecoveryDirectory = Directory(
+    '${directory.path}/native-multi-recovery',
+  )..createSync();
+  final nativeRecoveryMainPath = '${nativeRecoveryDirectory.path}/main.sqlite';
+  final nativeRecoveryAttachedPath =
+      '${nativeRecoveryDirectory.path}/attached.sqlite';
+  for (final (source, destination) in [
+    (atomicCrashMainPath, nativeRecoveryMainPath),
+    (atomicCrashAttachedPath, nativeRecoveryAttachedPath),
+  ]) {
+    File(source).copySync(destination);
+    File('$source-journal').copySync('$destination-journal');
+  }
+  final nativeRecoveryMaster = SqliteRollbackJournal.createSuperJournal(
+    nativeRecoveryMainPath,
+    ['$nativeRecoveryMainPath-journal', '$nativeRecoveryAttachedPath-journal'],
+  );
+  SqliteRollbackJournal.setSuperJournalAt(
+    '$nativeRecoveryMainPath-journal',
+    nativeRecoveryMaster.path,
+  );
+  SqliteRollbackJournal.setSuperJournalAt(
+    '$nativeRecoveryAttachedPath-journal',
+    nativeRecoveryMaster.path,
+  );
+  atomicWriter.stdin.writeln('exit');
+  await atomicWriter.stdin.flush();
+  await atomicWriter.exitCode;
+  for (final nativePath in [
+    nativeRecoveryMainPath,
+    nativeRecoveryAttachedPath,
+  ]) {
+    final nativeRecovery = Process.runSync('sqlite3', [
+      nativePath,
+      'PRAGMA integrity_check; SELECT value FROM journal_probe;',
+    ]);
+    assert(nativeRecovery.exitCode == 0, nativeRecovery.stderr);
+    assert(nativeRecovery.stdout.trim() == 'ok\nbefore', nativeRecovery.stdout);
+  }
+  final recoveredAtomicMain = PureDatabase.open(atomicCrashMainPath);
+  assert(
+    recoveredAtomicMain
+            .select('SELECT value FROM journal_probe')
+            .single['value'] ==
+        'before',
+    'a hot main journal rolls back while the super-journal exists',
+  );
+  recoveredAtomicMain.close();
+  final recoveredAtomicAttached = PureDatabase.open(atomicCrashAttachedPath);
+  assert(
+    recoveredAtomicAttached
+            .select('SELECT value FROM journal_probe')
+            .single['value'] ==
+        'before',
+    'a hot attached journal rolls back from the same super-journal',
+  );
+  recoveredAtomicAttached.close();
+  assert(
+    Directory(directory.path)
+        .listSync()
+        .where((entity) => entity.path.contains('atomic-crash-main.sqlite-mj'))
+        .isEmpty,
+    'the super-journal is removed after all participants recover',
+  );
 
   final lockPath = '${directory.path}/connections.sqlite';
   PureDatabase.open(lockPath)

@@ -1278,6 +1278,10 @@ class SqliteRollbackJournal {
   final bool _flush;
   final int _sizeLimit;
 
+  bool get canUseSuperJournal => _memorySnapshot == null;
+
+  String get path => _path;
+
   static SqliteRollbackJournal begin(
     String databasePath, {
     RandomAccessFile? databaseHandle,
@@ -1395,6 +1399,7 @@ class SqliteRollbackJournal {
 
     var pageSize = 0;
     var originalPageCount = 0;
+    String? masterJournalPath;
     final originalPages = <int, Uint8List>{};
     var headerOffset = 0;
     while (headerOffset + 28 <= bytes.length &&
@@ -1448,8 +1453,15 @@ class SqliteRollbackJournal {
       if (recordCount == 0xffffffff) break;
       final nextHeader =
           ((recordOffset + sectorSize - 1) ~/ sectorSize) * sectorSize;
-      if (nextHeader >= bytes.length ||
-          !_hasRollbackJournalMagic(bytes, nextHeader)) {
+      if (nextHeader >= bytes.length) {
+        break;
+      }
+      if (!_hasRollbackJournalMagic(bytes, nextHeader)) {
+        masterJournalPath = _readMasterJournalPath(
+          bytes,
+          nextHeader,
+          segmentPageSize,
+        );
         break;
       }
       headerOffset = nextHeader;
@@ -1458,6 +1470,10 @@ class SqliteRollbackJournal {
       throw SqliteFormatException('invalid rollback journal header');
     }
     if (originalPages.isEmpty) {
+      file.deleteSync();
+      return;
+    }
+    if (masterJournalPath != null && !File(masterJournalPath).existsSync()) {
       file.deleteSync();
       return;
     }
@@ -1486,6 +1502,118 @@ class SqliteRollbackJournal {
       _writeAll(databaseHandle, restored);
     }
     _finishJournal(file.path, journalMode, flush: flush, sizeLimit: sizeLimit);
+    if (masterJournalPath != null) {
+      _deleteResolvedSuperJournal(File(masterJournalPath));
+    }
+  }
+
+  static File createSuperJournal(
+    String databasePath,
+    Iterable<String> journalPaths,
+  ) {
+    final random = Random.secure();
+    File file;
+    while (true) {
+      final suffix = random
+          .nextInt(0x100000000)
+          .toRadixString(16)
+          .padLeft(8, '0');
+      file = File('$databasePath-mj$suffix');
+      if (!file.existsSync()) break;
+    }
+
+    final contents = BytesBuilder(copy: false);
+    for (final path in journalPaths) {
+      contents
+        ..add(utf8.encode(File(path).absolute.path))
+        ..addByte(0);
+    }
+    file.writeAsBytesSync(contents.takeBytes(), flush: true);
+    return file;
+  }
+
+  void setSuperJournal(String masterJournalPath) {
+    if (!canUseSuperJournal) {
+      throw StateError('in-memory journals cannot use a super-journal');
+    }
+    setSuperJournalAt(_path, masterJournalPath);
+  }
+
+  static void setSuperJournalAt(String journalPath, String masterJournalPath) {
+    final file = File(journalPath);
+    final bytes = file.readAsBytesSync();
+    if (!_hasRollbackJournalMagic(bytes, 0)) {
+      throw SqliteFormatException('invalid rollback journal');
+    }
+    final pageSize = _readU32(bytes, 24);
+    final sectorSize = _readU32(bytes, 20);
+    final name = utf8.encode(File(masterJournalPath).absolute.path);
+    final pointer = Uint8List(name.length + 20);
+    _writeU32(pointer, 0, 0x40000000 ~/ pageSize + 1);
+    pointer.setRange(4, 4 + name.length, name);
+    _writeU32(pointer, 4 + name.length, name.length);
+    var checksum = 0;
+    for (final byte in name) {
+      checksum += byte >= 0x80 ? byte - 0x100 : byte;
+    }
+    _writeU32(pointer, 8 + name.length, checksum);
+    pointer.setRange(12 + name.length, pointer.length, _rollbackJournalMagic);
+
+    final alignedLength =
+        ((bytes.length + sectorSize - 1) ~/ sectorSize) * sectorSize;
+    final output = file.openSync(mode: FileMode.append);
+    try {
+      if (alignedLength > bytes.length) {
+        output.writeFromSync(Uint8List(alignedLength - bytes.length));
+      }
+      output.writeFromSync(pointer);
+      output.flushSync();
+    } finally {
+      output.closeSync();
+    }
+  }
+
+  static String? _readMasterJournalPath(
+    List<int> bytes,
+    int offset,
+    int pageSize,
+  ) {
+    if (offset + 20 > bytes.length) return null;
+    final nameLength = bytes.length - offset - 20;
+    if (nameLength <= 0 ||
+        _readU32(bytes, offset) != 0x40000000 ~/ pageSize + 1 ||
+        _readU32(bytes, offset + 4 + nameLength) != nameLength ||
+        !_sameBytes(bytes, _rollbackJournalMagic, offset + 12 + nameLength)) {
+      return null;
+    }
+    var checksum = 0;
+    for (final byte in bytes.skip(offset + 4).take(nameLength)) {
+      checksum += byte >= 0x80 ? byte - 0x100 : byte;
+    }
+    if (_readU32(bytes, offset + 8 + nameLength) != (checksum & 0xffffffff)) {
+      return null;
+    }
+    try {
+      return utf8.decode(bytes.sublist(offset + 4, offset + 4 + nameLength));
+    } on FormatException {
+      return null;
+    }
+  }
+
+  static void _deleteResolvedSuperJournal(File file) {
+    if (!file.existsSync()) return;
+    final contents = utf8.decode(file.readAsBytesSync(), allowMalformed: true);
+    for (final path in contents.split('\u0000')) {
+      if (path.isEmpty) continue;
+      final journal = File(path);
+      if (!journal.existsSync()) continue;
+      final bytes = journal.readAsBytesSync();
+      if (bytes.length > _journalSectorSize &&
+          _hasRollbackJournalMagic(bytes, 0)) {
+        return;
+      }
+    }
+    file.deleteSync();
   }
 
   static void _recoverLegacyJournal(

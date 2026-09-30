@@ -2210,6 +2210,19 @@ class PureDatabase {
       _rollback();
       rethrow;
     }
+    final participants = _transactionParticipants();
+    final persistentParticipants = participants
+        .where((database) => database._pager != null)
+        .toList();
+    if (persistentParticipants.length > 1 &&
+        persistentParticipants.every(
+          (database) =>
+              !database._walTransaction &&
+              database._synchronous > 0 &&
+              database._transactionJournal?.canUseSuperJournal == true,
+        )) {
+      return _commitWithSuperJournal(participants, persistentParticipants);
+    }
     try {
       for (final attached in _attachedDatabases.values) {
         attached.database._commit();
@@ -2250,6 +2263,123 @@ class PureDatabase {
       }
     }
     return 0;
+  }
+
+  List<PureDatabase> _transactionParticipants() {
+    final participants = <PureDatabase>[];
+    final visited = <PureDatabase>{};
+    void collect(PureDatabase database) {
+      if (!database._inTransaction || !visited.add(database)) return;
+      participants.add(database);
+      for (final attached in database._attachedDatabases.values) {
+        collect(attached.database);
+      }
+    }
+
+    collect(this);
+    return participants;
+  }
+
+  int _commitWithSuperJournal(
+    List<PureDatabase> participants,
+    List<PureDatabase> persistentParticipants,
+  ) {
+    final journals = [
+      for (final database in persistentParticipants)
+        database._transactionJournal!,
+    ];
+    io.File? masterJournal;
+    var committed = false;
+    try {
+      masterJournal = SqliteRollbackJournal.createSuperJournal(
+        persistentParticipants.first._pager!.path,
+        journals.map((journal) => journal.path),
+      );
+      for (final journal in journals) {
+        journal.setSuperJournal(masterJournal.path);
+      }
+      for (final database in persistentParticipants) {
+        database._pager!.syncDatabase();
+      }
+      try {
+        masterJournal.deleteSync();
+        committed = true;
+      } catch (_) {
+        committed = !masterJournal.existsSync();
+        rethrow;
+      }
+    } catch (error, stackTrace) {
+      if (!committed && masterJournal != null && !masterJournal.existsSync()) {
+        committed = true;
+      }
+      if (!committed) {
+        try {
+          _rollback();
+          if (masterJournal?.existsSync() == true) {
+            masterJournal!.deleteSync();
+          }
+        } catch (_) {
+          // Keep the coordinator file so later journal recovery still rolls
+          // back every participant if an in-process rollback also fails.
+        }
+        Error.throwWithStackTrace(error, stackTrace);
+      }
+      final cleanupError = _finishSuperJournalCommit(participants);
+      if (cleanupError != null) {
+        Error.throwWithStackTrace(cleanupError, StackTrace.current);
+      }
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+
+    final cleanupError = _finishSuperJournalCommit(participants);
+    if (cleanupError != null) {
+      Error.throwWithStackTrace(cleanupError, StackTrace.current);
+    }
+    return 0;
+  }
+
+  Object? _finishSuperJournalCommit(List<PureDatabase> participants) {
+    Object? firstError;
+    for (final database in participants) {
+      try {
+        database._transactionJournal?.commit(
+          sizeLimit: database._journalSizeLimit,
+        );
+      } catch (error) {
+        firstError ??= error;
+      }
+      database._transactionJournal = null;
+      try {
+        database._finishVirtualTableDrops(commit: true);
+      } catch (error) {
+        firstError ??= error;
+      }
+      database._dirtyVirtualTables.clear();
+      database._clearCommittedTransactionState();
+    }
+    return firstError;
+  }
+
+  void _clearCommittedTransactionState() {
+    _savepoints.clear();
+    _memoryTransactionTables = null;
+    _memoryTransactionTemporaryTables = null;
+    _memoryTransactionViews = null;
+    _memoryTransactionTemporaryViews = null;
+    _memoryTransactionTriggers = null;
+    _transactionTemporaryTriggers = null;
+    _memoryTransactionSchemaVersion = null;
+    _memoryTransactionPageSize = null;
+    _memoryTransactionTemporaryPragmaValues = null;
+    _inTransaction = false;
+    _deferForeignKeys = false;
+    _transactionAttachedDatabases.clear();
+    if (_walTransaction) {
+      _pager?.releaseWalWriterLock();
+      _walTransaction = false;
+    } else {
+      _pager?.releaseExclusiveLock();
+    }
   }
 
   int _rollback() {
@@ -3425,6 +3555,31 @@ class PureDatabase {
     return 0;
   }
 
+  bool _sourceHasRenameColumn(
+    String sourceName,
+    String columnName, {
+    required bool temporary,
+  }) {
+    if (sourceName.contains('\u0000')) return true;
+    final key = _key(sourceName);
+    final table = temporary
+        ? _temporaryTables[key] ?? _tables[key]
+        : _tables[key];
+    if (table != null) {
+      return table.columns.any(
+        (column) => _key(column.name) == _key(columnName),
+      );
+    }
+    final view = temporary ? _temporaryViews[key] ?? _views[key] : _views[key];
+    if (view != null) {
+      return (view.columns ?? _selectColumnNames(view.query)).any(
+        (column) => _key(column) == _key(columnName),
+      );
+    }
+    // An unresolved source makes the reference potentially ambiguous.
+    return true;
+  }
+
   int _renameColumn(_RenameColumn statement) {
     final table = _table(statement.table, schema: statement.schema);
     if (table.virtualTable != null) {
@@ -3505,26 +3660,11 @@ class PureDatabase {
       if (table.isTemporary && !view.temporary) continue;
       final viewSql = view.schemaSql;
       if (viewSql == null) throw SqliteFormatException('missing view SQL');
-      bool sourceHasColumn(String sourceName) {
-        final key = _key(sourceName);
-        final sourceTable = view.temporary
-            ? _temporaryTables[key] ?? _tables[key]
-            : _tables[key];
-        if (sourceTable != null) {
-          return sourceTable.columns.any(
-            (sourceColumn) => _key(sourceColumn.name) == _key(column.name),
-          );
-        }
-        final sourceView = view.temporary
-            ? _temporaryViews[key] ?? _views[key]
-            : _views[key];
-        if (sourceView != null) {
-          return (sourceView.columns ?? _selectColumnNames(sourceView.query))
-              .any((sourceColumn) => _key(sourceColumn) == _key(column.name));
-        }
-        // An unresolved source makes the view dependency ambiguous.
-        return true;
-      }
+      bool sourceHasColumn(String sourceName) => _sourceHasRenameColumn(
+        sourceName,
+        column.name,
+        temporary: view.temporary,
+      );
 
       final tokens = _Tokenizer(viewSql).tokenize();
       final tokenByStart = {
@@ -3912,6 +4052,11 @@ class PureDatabase {
         triggerBelongsToTable,
         entry.value,
         table.name,
+        (sourceName) => _sourceHasRenameColumn(
+          sourceName,
+          column.name,
+          temporary: entry.value.temporary,
+        ),
       );
       if (!references.safe) {
         throw PureSqlException(
@@ -4116,6 +4261,11 @@ class PureDatabase {
         triggerBelongsToTable,
         trigger,
         table.name,
+        (sourceName) => _sourceHasRenameColumn(
+          sourceName,
+          column.name,
+          temporary: trigger.temporary,
+        ),
       );
       if (!references.safe || references.tokens.isNotEmpty) {
         throw PureSqlException('cannot drop a column referenced by a trigger');
@@ -9828,6 +9978,7 @@ bool _triggerReferencesTable(String sql, String tableName) =>
   bool belongsToTable,
   _CreateTrigger trigger,
   String alteredTable,
+  bool Function(String sourceName) sourceHasColumn,
 ) {
   final tokens = _Tokenizer(sql).tokenize();
   final begin = tokens.indexWhere(
@@ -9968,7 +10119,7 @@ bool _triggerReferencesTable(String sql, String tableName) =>
         alteredTable,
         column,
         querySql,
-        (_) => true,
+        sourceHasColumn,
       );
       if (!result.safe) return false;
       markAnalyzed(0, endOffset - startOffset);
@@ -10014,7 +10165,7 @@ bool _triggerReferencesTable(String sql, String tableName) =>
           alteredTable,
           column,
           segment,
-          (_) => true,
+          sourceHasColumn,
         );
         if (!result.safe) return false;
         for (final reference in result.tokens) {
@@ -10362,12 +10513,20 @@ String _replaceSqlTokens(String sql, List<_Token> targets, String newName) {
   final usingJoin = query.joins.any(
     (join) => join.usingColumns.any((name) => _key(name) == _key(columnName)),
   );
-  if (query.items.any((item) {
+  final aliasedColumnCollision = query.items.any((item) {
     if (_key(item.outputName) != _key(columnName)) return false;
     final expression = item.expression;
     return expression is! _Column ||
         _key(expression.name.split('.').last) != _key(columnName);
-  })) {
+  });
+  bool usesUnqualifiedName(_Expr? expression) =>
+      expression is _Column &&
+      !expression.name.contains('.') &&
+      _key(expression.name) == _key(columnName);
+  if (aliasedColumnCollision &&
+      (query.orderBy.any((order) => usesUnqualifiedName(order.expression)) ||
+          query.groupBy.any(usesUnqualifiedName) ||
+          usesUnqualifiedName(query.having))) {
     return (safe: false, tokens: const []);
   }
   final tokens = _Tokenizer(sql).tokenize();
@@ -10404,21 +10563,6 @@ String _replaceSqlTokens(String sql, List<_Token> targets, String newName) {
     'WHERE',
     'WINDOW',
   };
-  var depth = 0;
-  for (var index = fromIndex + 1; index < tokens.length; index++) {
-    final token = tokens[index];
-    if (token.text == '(') depth++;
-    if (token.text == ')') depth--;
-    if (depth == 0 && token.text == ',') {
-      return (safe: false, tokens: const []);
-    }
-    if (depth == 0 &&
-        token.type == _TokenType.word &&
-        !token.quoted &&
-        fromClauseEnd.contains(token.text.toUpperCase())) {
-      break;
-    }
-  }
   final sourceTokens = <int>{};
   const sourceTerminators = {
     'CROSS',
@@ -10439,17 +10583,10 @@ String _replaceSqlTokens(String sql, List<_Token> targets, String newName) {
     'WHERE',
     'WINDOW',
   };
-  for (var index = selectIndex + 1; index < tokens.length; index++) {
-    final token = tokens[index];
-    if (token.type != _TokenType.word || token.quoted) continue;
-    if (token.text.toUpperCase() != 'FROM' &&
-        token.text.toUpperCase() != 'JOIN') {
-      continue;
-    }
-    var sourceIndex = index + 1;
+  bool markSource(int sourceIndex) {
     if (sourceIndex >= tokens.length ||
         tokens[sourceIndex].type != _TokenType.word) {
-      return (safe: false, tokens: const []);
+      return false;
     }
     sourceTokens.add(sourceIndex);
     if (sourceIndex + 2 < tokens.length &&
@@ -10460,13 +10597,13 @@ String _replaceSqlTokens(String sql, List<_Token> targets, String newName) {
       sourceIndex += 2;
     }
     final aliasIndex = sourceIndex + 1;
-    if (aliasIndex >= tokens.length) continue;
+    if (aliasIndex >= tokens.length) return true;
     if (tokens[aliasIndex].type == _TokenType.word &&
         !tokens[aliasIndex].quoted &&
         tokens[aliasIndex].text.toUpperCase() == 'AS') {
       if (aliasIndex + 1 >= tokens.length ||
           tokens[aliasIndex + 1].type != _TokenType.word) {
-        return (safe: false, tokens: const []);
+        return false;
       }
       sourceTokens
         ..add(aliasIndex)
@@ -10477,6 +10614,41 @@ String _replaceSqlTokens(String sql, List<_Token> targets, String newName) {
               tokens[aliasIndex].text.toUpperCase(),
             ))) {
       sourceTokens.add(aliasIndex);
+    }
+    return true;
+  }
+
+  var depth = 0;
+  var inFromClause = false;
+  for (var index = selectIndex + 1; index < tokens.length; index++) {
+    final token = tokens[index];
+    if (token.text == '(') {
+      depth++;
+      continue;
+    }
+    if (token.text == ')') {
+      depth--;
+      continue;
+    }
+    if (depth != 0) continue;
+    if (token.type == _TokenType.word && !token.quoted) {
+      final word = token.text.toUpperCase();
+      if (word == 'FROM') {
+        inFromClause = true;
+        if (!markSource(index + 1)) return (safe: false, tokens: const []);
+        continue;
+      }
+      if (inFromClause && fromClauseEnd.contains(word)) {
+        inFromClause = false;
+        continue;
+      }
+      if (inFromClause && word == 'JOIN') {
+        if (!markSource(index + 1)) return (safe: false, tokens: const []);
+        continue;
+      }
+    }
+    if (inFromClause && token.text == ',') {
+      if (!markSource(index + 1)) return (safe: false, tokens: const []);
     }
   }
   const keywords = {

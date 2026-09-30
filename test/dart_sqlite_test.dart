@@ -858,6 +858,23 @@ void main() {
             .join(',') ==
         'second,fourth',
   );
+  replaceTriggerDb
+    ..execute(
+      'CREATE TABLE replace_trigger_alias_audit (value TEXT PRIMARY KEY)',
+    )
+    ..execute('''
+      CREATE TRIGGER replace_trigger_alias_ai AFTER INSERT ON replace_trigger_rows
+      BEGIN
+        REPLACE INTO replace_trigger_alias_audit VALUES (NEW.value);
+      END
+    ''')
+    ..execute("INSERT INTO replace_trigger_rows VALUES (3, 'trigger-alias')");
+  assert(
+    replaceTriggerDb
+            .select('SELECT value FROM replace_trigger_alias_audit')
+            .single['value'] ==
+        'trigger-alias',
+  );
 
   final beforeTriggerDb = PureDatabase.memory()
     ..execute(
@@ -2724,6 +2741,22 @@ void main() {
     // ORDER BY resolves to the output alias, not necessarily the source column.
   }
   renameColumnDb
+    ..execute('CREATE TABLE rename_alias_safe_source (old_name TEXT)')
+    ..execute('''
+      CREATE VIEW rename_alias_safe_view AS
+      SELECT 'fixed' AS old_name, old_name AS source_value
+      FROM rename_alias_safe_source WHERE old_name <> ''
+    ''')
+    ..execute("INSERT INTO rename_alias_safe_source VALUES ('value')")
+    ..execute('''
+      ALTER TABLE rename_alias_safe_source RENAME COLUMN old_name TO new_name
+    ''');
+  final renamedAliasView = renameColumnDb
+      .select('SELECT old_name, source_value FROM rename_alias_safe_view')
+      .single;
+  assert(renamedAliasView['old_name'] == 'fixed');
+  assert(renamedAliasView['source_value'] == 'value');
+  renameColumnDb
     ..execute('CREATE TABLE rename_complex_view_other (new_name TEXT)')
     ..execute('''
       CREATE VIEW rename_complex_dependent_view AS
@@ -2760,6 +2793,52 @@ void main() {
   ''').single;
   assert(renamedUniqueJoinView['new_name'] == 'unique');
   assert(renamedUniqueJoinView['keep_name'] == 'kept');
+  renameColumnDb
+    ..execute('CREATE TABLE rename_comma_target (old_name TEXT)')
+    ..execute('CREATE TABLE rename_comma_other (keep_name TEXT)')
+    ..execute('''
+      CREATE VIEW rename_comma_view AS
+      SELECT old_name, keep_name
+      FROM rename_comma_target, rename_comma_other
+      WHERE old_name <> ''
+    ''')
+    ..execute("INSERT INTO rename_comma_target VALUES ('comma')")
+    ..execute("INSERT INTO rename_comma_other VALUES ('cross')")
+    ..execute('''
+      ALTER TABLE rename_comma_target RENAME COLUMN old_name TO new_name
+    ''');
+  final renamedCommaView = renameColumnDb
+      .select('SELECT new_name, keep_name FROM rename_comma_view')
+      .single;
+  assert(renamedCommaView['new_name'] == 'comma');
+  assert(renamedCommaView['keep_name'] == 'cross');
+  renameColumnDb
+    ..execute('CREATE TABLE rename_comma_trigger_target (old_name TEXT)')
+    ..execute('CREATE TABLE rename_comma_trigger_other (keep_name TEXT)')
+    ..execute('CREATE TABLE rename_comma_trigger_source (id INTEGER)')
+    ..execute('CREATE TABLE rename_comma_trigger_log (value TEXT)')
+    ..execute('''
+      CREATE TRIGGER rename_comma_trigger_ai
+      AFTER INSERT ON rename_comma_trigger_source
+      BEGIN
+        INSERT INTO rename_comma_trigger_log
+        SELECT old_name || keep_name
+        FROM rename_comma_trigger_target, rename_comma_trigger_other;
+      END
+    ''')
+    ..execute("INSERT INTO rename_comma_trigger_target VALUES ('target')")
+    ..execute("INSERT INTO rename_comma_trigger_other VALUES ('other')")
+    ..execute('''
+      ALTER TABLE rename_comma_trigger_target
+      RENAME COLUMN old_name TO new_name
+    ''')
+    ..execute('INSERT INTO rename_comma_trigger_source VALUES (1)');
+  assert(
+    renameColumnDb
+            .select('SELECT value FROM rename_comma_trigger_log')
+            .single['value'] ==
+        'targetother',
+  );
   renameColumnDb
     ..execute(
       'CREATE TABLE rename_natural_left (old_name TEXT, left_value TEXT)',
