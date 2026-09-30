@@ -21,6 +21,52 @@ Future<void> main(List<String> args) async {
   final path = '${directory.path}/data.sqlite';
 
   final database = PureDatabase.open(path);
+  assert(database.select('PRAGMA mmap_size').single['mmap_size'] == 0);
+  database.execute('PRAGMA mmap_size = 1048576');
+  assert(database.select('PRAGMA mmap_size').single['mmap_size'] == 0);
+  final secureDeletePath = '${directory.path}/secure-delete.sqlite';
+  final secureDeleteDb = PureDatabase.open(secureDeletePath)
+    ..execute('CREATE TABLE secure_delete_probe (payload TEXT)')
+    ..execute('PRAGMA secure_delete = ON');
+  const forensicMarker = 'sensitive-payload-forensic-marker';
+  secureDeleteDb.execute('INSERT INTO secure_delete_probe VALUES (?)', [
+    'a' * 8000 + forensicMarker + 'z' * 8000,
+  ]);
+  secureDeleteDb.execute('DELETE FROM secure_delete_probe');
+  assert(
+    (secureDeleteDb.select('PRAGMA freelist_count').single['freelist_count']
+            as int) >
+        0,
+    'rewriting a row must return its overflow pages to the freelist',
+  );
+  secureDeleteDb.close();
+  final securelyDeletedBytes = File(
+    secureDeletePath,
+  ).readAsBytesSync().toList();
+  assert(
+    !String.fromCharCodes(securelyDeletedBytes).contains(forensicMarker),
+    'secure_delete=ON must scrub deleted overflow payload bytes',
+  );
+
+  final fastSecureDeletePath = '${directory.path}/secure-delete-fast.sqlite';
+  final fastSecureDeleteDb = PureDatabase.open(fastSecureDeletePath)
+    ..execute('CREATE TABLE secure_delete_probe (payload TEXT)')
+    ..execute('PRAGMA secure_delete = FAST')
+    ..execute('INSERT INTO secure_delete_probe VALUES (?)', [
+      'a' * 8000 + forensicMarker + 'z' * 8000,
+    ])
+    ..execute('DELETE FROM secure_delete_probe');
+  assert(
+    fastSecureDeleteDb.select('PRAGMA secure_delete').single['secure_delete'] ==
+        2,
+  );
+  fastSecureDeleteDb.close();
+  assert(
+    String.fromCharCodes(
+      File(fastSecureDeletePath).readAsBytesSync(),
+    ).contains(forensicMarker),
+    'secure_delete=FAST may retain deleted bytes on freelist pages',
+  );
 
   final attachedPath = '${directory.path}/attached.sqlite';
   final attachedFixture = PureDatabase.open(attachedPath);
@@ -28,6 +74,7 @@ Future<void> main(List<String> args) async {
     'CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)',
   );
   attachedFixture.execute("INSERT INTO items VALUES (1, 'attached')");
+  attachedFixture.execute('CREATE INDEX items_value_idx ON items(value)');
   attachedFixture.execute('CREATE VIEW item_view AS SELECT value FROM items');
   attachedFixture.execute('CREATE TABLE copied_items (id INTEGER, value TEXT)');
   attachedFixture.execute('PRAGMA user_version = 23');
@@ -41,7 +88,23 @@ Future<void> main(List<String> args) async {
   final attachmentDb = PureDatabase.open(
     '${directory.path}/attachment-main.sqlite',
   );
+  attachmentDb.execute('PRAGMA secure_delete = FAST');
   attachmentDb.execute('ATTACH DATABASE ? AS archive', [attachedPath]);
+  assert(
+    attachmentDb
+            .select('PRAGMA archive.secure_delete')
+            .single['secure_delete'] ==
+        2,
+    'newly attached schemas inherit main secure_delete mode',
+  );
+  attachmentDb.execute('PRAGMA secure_delete = ON');
+  assert(
+    attachmentDb
+            .select('PRAGMA archive.secure_delete')
+            .single['secure_delete'] ==
+        1,
+    'unqualified secure_delete changes attached schemas too',
+  );
   final databaseList = attachmentDb.select('PRAGMA database_list');
   assert(databaseList.length == 2);
   assert(databaseList[0]['name'] == 'main');
@@ -255,6 +318,15 @@ Future<void> main(List<String> args) async {
         'triggered',
   );
   attachmentDb.execute('ANALYZE archive.attachment_ddl');
+  attachmentDb.execute('REINDEX archive.items_value_idx');
+  attachmentDb.execute('REINDEX archive.items');
+  attachmentDb.execute('REINDEX');
+  assert(
+    attachmentDb
+            .select('PRAGMA archive.integrity_check')
+            .single['integrity_check'] ==
+        'ok',
+  );
   attachmentDb.execute('VACUUM archive');
   final archiveVacuumPath = '${directory.path}/attached-vacuum.sqlite';
   attachmentDb.execute('VACUUM archive INTO ?', [archiveVacuumPath]);

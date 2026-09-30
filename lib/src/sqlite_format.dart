@@ -404,6 +404,7 @@ class SqlitePagerSync {
   int synchronous = 2;
   int walAutoCheckpointPages = 1000;
   int journalSizeLimit = -1;
+  int secureDeleteMode = 0;
   bool _newDatabase;
   bool _walMode;
   SqliteWalSnapshot? _walSnapshot;
@@ -1000,7 +1001,11 @@ class SqlitePagerSync {
     if (trunkPage == 0) {
       header.firstFreelistTrunkPage = pageNumber;
       header.freelistPageCount++;
-      final trunk = Uint8List(header.pageSize);
+      final trunk = secureDeleteMode == 1
+          ? Uint8List(header.pageSize)
+          : Uint8List.fromList(readPage(pageNumber));
+      _writeU32(trunk, 0, 0);
+      _writeU32(trunk, 4, 0);
       writePage(pageNumber, trunk);
       return;
     }
@@ -1008,6 +1013,9 @@ class SqlitePagerSync {
     final leafCount = _readU32(trunk, 4);
     final capacity = (header.pageSize - 8) ~/ 4;
     if (leafCount < capacity) {
+      if (secureDeleteMode == 1) {
+        writePage(pageNumber, Uint8List(header.pageSize));
+      }
       _writeU32(trunk, 8 + leafCount * 4, pageNumber);
       _writeU32(trunk, 4, leafCount + 1);
       header.freelistPageCount++;
@@ -1016,8 +1024,11 @@ class SqlitePagerSync {
     }
     header.firstFreelistTrunkPage = pageNumber;
     header.freelistPageCount++;
-    final newTrunk = Uint8List(header.pageSize);
+    final newTrunk = secureDeleteMode == 1
+        ? Uint8List(header.pageSize)
+        : Uint8List.fromList(readPage(pageNumber));
     _writeU32(newTrunk, 0, trunkPage);
+    _writeU32(newTrunk, 4, 0);
     writePage(pageNumber, newTrunk);
   }
 

@@ -4534,6 +4534,34 @@ void main() {
   assert(db.select('SELECT 名称 FROM 数据表 WHERE 编号 = 1').single['名称'] == '咖啡');
 
   final compatible = PureDatabase.memory();
+  compatible
+    ..execute('CREATE TABLE replace_rows (id INTEGER PRIMARY KEY, value TEXT)')
+    ..execute("INSERT INTO replace_rows VALUES (1, 'before')")
+    ..execute("REPLACE INTO replace_rows VALUES (1, 'after')");
+  assert(
+    compatible
+            .select('SELECT value FROM replace_rows WHERE id = 1')
+            .single['value'] ==
+        'after',
+  );
+  assert(
+    compatible
+            .select(
+              "REPLACE INTO replace_rows VALUES (1, 'returned') RETURNING value",
+            )
+            .single['value'] ==
+        'returned',
+  );
+  compatible.execute('''
+    WITH replacement(value) AS (VALUES ('from cte'))
+    REPLACE INTO replace_rows SELECT 1, value FROM replacement
+  ''');
+  assert(
+    compatible
+            .select('SELECT value FROM replace_rows WHERE id = 1')
+            .single['value'] ==
+        'from cte',
+  );
   compatible.execute('''
     CREATE TABLE "group" (
       "group name" TEXT,
@@ -4865,8 +4893,12 @@ void main() {
     'index_list',
     'index_xinfo',
     'journal_size_limit',
+    'mmap_size',
     'read_uncommitted',
+    'secure_delete',
+    'shrink_memory',
     'short_column_names',
+    'threads',
     'temp_store',
     'wal_autocheckpoint',
   ]) {
@@ -4987,6 +5019,36 @@ void main() {
   assert(
     compatible.select('PRAGMA automatic_index').single['automatic_index'] == 1,
   );
+  assert(compatible.select('PRAGMA threads').single['threads'] == 0);
+  compatible.execute('PRAGMA threads = 4');
+  assert(compatible.select('PRAGMA threads').single['threads'] == 4);
+  compatible.execute('PRAGMA threads = -1');
+  assert(compatible.select('PRAGMA threads').single['threads'] == 4);
+  compatible.execute('PRAGMA threads = 999999');
+  assert(compatible.select('PRAGMA threads').single['threads'] == 8);
+  compatible.execute('PRAGMA temp.threads = 3');
+  assert(compatible.select('PRAGMA threads').single['threads'] == 3);
+  compatible.execute('PRAGMA secure_delete = FAST');
+  assert(
+    compatible.select('PRAGMA secure_delete').single['secure_delete'] == 2,
+  );
+  compatible.execute('PRAGMA secure_delete = 2');
+  assert(
+    compatible.select('PRAGMA secure_delete').single['secure_delete'] == 1,
+  );
+  compatible.execute('PRAGMA temp.secure_delete = FAST');
+  assert(
+    compatible.select('PRAGMA temp.secure_delete').single['secure_delete'] == 2,
+  );
+  assert(
+    compatible.select('PRAGMA secure_delete').single['secure_delete'] == 1,
+  );
+  assert(compatible.select('PRAGMA shrink_memory').isEmpty);
+  compatible.execute('PRAGMA shrink_memory');
+  assert(compatible.select('PRAGMA mmap_size').isEmpty);
+  assert(compatible.select('PRAGMA temp.mmap_size').isEmpty);
+  compatible.execute('PRAGMA mmap_size = 1048576');
+  assert(compatible.select('PRAGMA mmap_size').isEmpty);
   compatible.execute('PRAGMA automatic_index = OFF');
   assert(
     compatible.select('PRAGMA automatic_index').single['automatic_index'] == 0,
@@ -5701,6 +5763,25 @@ void main() {
             .single['stat'] ==
         '2 2',
   );
+  final reindexDb = PureDatabase.memory()
+    ..execute('CREATE TABLE reindex_rows (value TEXT)')
+    ..execute(
+      'CREATE INDEX reindex_rows_value ON reindex_rows(value COLLATE NOCASE)',
+    )
+    ..execute("INSERT INTO reindex_rows VALUES ('b'), ('A')")
+    ..execute('CREATE TEMP TABLE reindex_temp (value TEXT)')
+    ..execute('CREATE TEMP INDEX reindex_temp_value ON reindex_temp(value)');
+  reindexDb.execute('REINDEX');
+  reindexDb.execute('REINDEX NOCASE');
+  reindexDb.execute('REINDEX reindex_rows');
+  reindexDb.execute('REINDEX main.reindex_rows_value');
+  reindexDb.execute('REINDEX temp.reindex_temp_value');
+  try {
+    reindexDb.execute('REINDEX missing_reindex_target');
+    assert(false, 'REINDEX must reject an unknown target');
+  } on PureSqlException {
+    // Expected: the target is neither a collation, table, nor index.
+  }
   try {
     analyzeDb.execute('ANALYZE attached.analyze_rows');
     assert(false, 'ANALYZE should reject unattached schemas');

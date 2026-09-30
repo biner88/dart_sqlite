@@ -78,6 +78,7 @@ const _supportedPragmaNames = {
   'busy_timeout',
   'cache_size',
   'case_sensitive_like',
+  'mmap_size',
   'collation_list',
   'compile_options',
   'count_changes',
@@ -110,8 +111,11 @@ const _supportedPragmaNames = {
   'recursive_triggers',
   'reverse_unordered_selects',
   'schema_version',
+  'secure_delete',
   'short_column_names',
   'synchronous',
+  'shrink_memory',
+  'threads',
   'temp_store',
   'table_info',
   'table_list',
@@ -192,7 +196,9 @@ const _connectionPragmaNames = {
   'read_uncommitted',
   'recursive_triggers',
   'reverse_unordered_selects',
+  'shrink_memory',
   'short_column_names',
+  'threads',
   'temp_store',
   'wal_autocheckpoint',
 };
@@ -205,6 +211,7 @@ const _defaultTemporaryPragmaValues = <String, Object>{
   'max_page_count': 1073741823,
   'page_size': 4096,
   'page_size_locked': false,
+  'secure_delete': 0,
   'schema_version': 0,
   'synchronous': 0,
   'user_version': 0,
@@ -225,15 +232,18 @@ const _writablePragmaNames = {
   'journal_mode',
   'journal_size_limit',
   'legacy_alter_table',
+  'mmap_size',
   'max_page_count',
   'page_size',
   'query_only',
   'read_uncommitted',
   'recursive_triggers',
   'reverse_unordered_selects',
+  'secure_delete',
   'short_column_names',
   'schema_version',
   'synchronous',
+  'threads',
   'temp_store',
   'user_version',
   'wal_autocheckpoint',
@@ -514,6 +524,8 @@ class PureDatabase {
   var _schemaVersion = 1;
   var _analysisLimit = 0;
   var _automaticIndex = true;
+  var _secureDeleteMode = 0;
+  var _threads = 0;
   var _countChanges = false;
   var _fullColumnNames = false;
   var _shortColumnNames = true;
@@ -689,6 +701,19 @@ class PureDatabase {
       return _executeOnAttachedDatabase(
         attached,
         _Vacuum(null, into),
+        values,
+        sql,
+      );
+    }
+    if (statement case _Reindex(
+      :final schema,
+      :final target,
+    ) when schema != null && !const ['main', 'temp'].contains(_key(schema))) {
+      final attached = _attachedDatabases[_key(schema)];
+      if (attached == null) throw PureSqlException('no such database: $schema');
+      return _executeOnAttachedDatabase(
+        attached,
+        _Reindex(target, schema: 'main'),
         values,
         sql,
       );
@@ -1203,6 +1228,7 @@ class PureDatabase {
       .._ignoreCheckConstraints = _ignoreCheckConstraints
       .._queryOnly = _queryOnly || database._readOnly
       .._readUncommitted = _readUncommitted
+      .._threads = _threads
       .._reverseUnorderedSelects = _reverseUnorderedSelects
       .._legacyAlterTable = _legacyAlterTable
       .._walAutoCheckpoint = _walAutoCheckpoint
@@ -1213,6 +1239,11 @@ class PureDatabase {
         ..busyTimeout = _busyTimeout
         ..walAutoCheckpointPages = _walAutoCheckpoint;
     }
+  }
+
+  void _setSecureDeleteMode(int mode) {
+    _secureDeleteMode = mode;
+    _pager?.secureDeleteMode = mode;
   }
 
   void _copyFunctionOverloads<T>(
@@ -1240,6 +1271,7 @@ class PureDatabase {
       statement is _RenameColumn ||
       statement is _DropColumn ||
       statement is _Analyze ||
+      statement is _Reindex ||
       statement is _Vacuum ||
       statement is _Insert ||
       statement is _Update ||
@@ -1612,6 +1644,7 @@ class PureDatabase {
         _DropColumn() => _dropColumn(statement),
         _AlterTable() => _alterTable(statement, sql: sql),
         _Analyze() => _analyze(statement),
+        _Reindex() => _reindex(statement),
         _Vacuum() => _vacuum(statement, values),
         _Begin() ||
         _Commit() ||
@@ -1694,6 +1727,7 @@ class PureDatabase {
             onLog: _onLog,
             virtualTableModules: _virtualTableModules,
           );
+    database._setSecureDeleteMode(_secureDeleteMode);
     if (readOnly) {
       database
         .._readOnly = true
@@ -4444,6 +4478,123 @@ class PureDatabase {
     return 0;
   }
 
+  int _reindex(_Reindex statement) {
+    final schema = statement.schema == null ? null : _key(statement.schema!);
+    if (schema != null) return _reindexSchema(statement.target, schema);
+
+    final target = statement.target;
+    if (target == null) {
+      _reindexSchema(null, 'temp');
+      _reindexSchema(null, 'main');
+      for (final attached in _attachedDatabases.values) {
+        _executeOnAttachedDatabase(
+          attached,
+          _Reindex(null, schema: 'main'),
+          const [],
+          'REINDEX',
+        );
+      }
+      return 0;
+    }
+
+    // Collation names take precedence over table and index names in SQLite.
+    final collation = _key(target);
+    if (const {'binary', 'nocase'}.contains(collation)) {
+      _reindexSchema(target, 'temp');
+      _reindexSchema(target, 'main');
+      for (final attached in _attachedDatabases.values) {
+        _executeOnAttachedDatabase(
+          attached,
+          _Reindex(target, schema: 'main'),
+          const [],
+          'REINDEX $target',
+        );
+      }
+      return 0;
+    }
+
+    if (_reindexTargetInSchema(target, 'temp')) return 0;
+    if (_reindexTargetInSchema(target, 'main')) return 0;
+    for (final attached in _attachedDatabases.values) {
+      if (_attachedHasReindexTarget(attached.database, target)) {
+        _executeOnAttachedDatabase(
+          attached,
+          _Reindex(target, schema: 'main'),
+          const [],
+          'REINDEX $target',
+        );
+        return 0;
+      }
+    }
+    throw PureSqlException('no such collation sequence: $target');
+  }
+
+  int _reindexSchema(String? target, String schema) {
+    if (schema != 'main' && schema != 'temp') {
+      throw PureSqlException('no such database: $schema');
+    }
+    final indexes = schema == 'temp' ? _temporaryIndexes : _indexes;
+    final tables = schema == 'temp' ? _temporaryTables : _tables;
+    Iterable<_Index> selected;
+    if (target == null) {
+      selected = indexes.values;
+    } else if (const {'binary', 'nocase'}.contains(_key(target))) {
+      selected = indexes.values.where(
+        (index) => index.terms.any(
+          (term) =>
+              _indexTermCollation(index.table, term) ==
+              _key(target).toUpperCase(),
+        ),
+      );
+    } else {
+      final key = _key(target);
+      final index = indexes[key];
+      if (index != null) {
+        selected = [index];
+      } else {
+        final table = tables[key];
+        if (table == null) {
+          throw PureSqlException('no such collation sequence: $target');
+        }
+        selected = table.indexes;
+      }
+    }
+    for (final index in selected.toList()) {
+      _validateIndexRows(index, index.table.rows);
+      final pager = _pager;
+      final rootPage = index.rootPage;
+      if (pager != null && schema == 'main' && rootPage != null) {
+        SqliteIndexBtree.rewriteRows(
+          pager,
+          rootPage,
+          _indexEntries(index),
+          compare: (left, right) => _compareIndexEntries(index, left, right),
+        );
+      }
+    }
+    return 0;
+  }
+
+  bool _reindexTargetInSchema(String target, String schema) {
+    final indexes = schema == 'temp' ? _temporaryIndexes : _indexes;
+    final tables = schema == 'temp' ? _temporaryTables : _tables;
+    final index = indexes[_key(target)];
+    if (index != null) {
+      _reindexSchema(target, schema);
+      return true;
+    }
+    final table = tables[_key(target)];
+    if (table != null) {
+      _reindexSchema(target, schema);
+      return true;
+    }
+    return false;
+  }
+
+  bool _attachedHasReindexTarget(PureDatabase database, String target) =>
+      database._indexes.containsKey(_key(target)) ||
+      database._tables.containsKey(_key(target));
+
   int _vacuumInto(_Expr expression, List<Object?> parameters) {
     final sourcePager = _pager;
     final sourceHeader =
@@ -4706,6 +4857,9 @@ class PureDatabase {
       case 'cache_size':
       case 'journal_size_limit':
         _temporaryPragmaValues[name] = _asInt(value);
+      case 'secure_delete':
+        final mode = _secureDeleteInput(value);
+        if (mode != null) _temporaryPragmaValues[name] = mode;
       case 'default_cache_size':
         final pageCount = _asInt(value).abs();
         if (pageCount > 0x7fffffff) {
@@ -4754,6 +4908,7 @@ class PureDatabase {
 
   int _pragma(_Pragma statement, List<Object?> parameters) {
     final name = _key(statement.name);
+    if (name == 'shrink_memory') return 0;
     if (name == 'wal_checkpoint') {
       _walCheckpointRows(statement, parameters);
       return 0;
@@ -4768,6 +4923,24 @@ class PureDatabase {
     }
     if (name == 'automatic_index') {
       _automaticIndex = _truthy(value);
+      return 0;
+    }
+    if (name == 'threads') {
+      final requested = _asInt(value);
+      if (requested >= 0) _threads = math.min(requested, 8).toInt();
+      return 0;
+    }
+    if (name == 'mmap_size') return 0;
+    if (name == 'secure_delete') {
+      final mode = _secureDeleteInput(value);
+      if (mode == null) return 0;
+      _setSecureDeleteMode(mode);
+      if (statement.schema == null) {
+        _temporaryPragmaValues['secure_delete'] = mode;
+        for (final attached in _attachedDatabases.values) {
+          attached.database._setSecureDeleteMode(mode);
+        }
+      }
       return 0;
     }
     if (name == 'count_changes') {
@@ -5050,6 +5223,8 @@ class PureDatabase {
     }
     if (name == 'analysis_limit') return _analysisLimit;
     if (name == 'automatic_index') return _automaticIndex ? 1 : 0;
+    if (name == 'threads') return _threads;
+    if (name == 'secure_delete') return _secureDeleteMode;
     if (name == 'count_changes') return _countChanges ? 1 : 0;
     if (name == 'full_column_names') return _fullColumnNames ? 1 : 0;
     if (name == 'short_column_names') return _shortColumnNames ? 1 : 0;
@@ -5111,6 +5286,15 @@ class PureDatabase {
   List<SqlRow> _pragmaRows(_Pragma statement, List<Object?> parameters) {
     final name = _key(statement.name);
     if (!_supportedPragmaNames.contains(name)) return const [];
+    if (name == 'shrink_memory') return const [];
+    if (name == 'mmap_size') {
+      if (_key(statement.schema ?? '') == 'temp' || _pager == null) {
+        return const [];
+      }
+      return const [
+        {'mmap_size': 0},
+      ];
+    }
     if (name == 'pragma_list') {
       return [
         for (final pragma in _supportedPragmaNames) {'name': pragma},
@@ -15975,6 +16159,22 @@ bool _glob(String value, String pattern) {
   return RegExp(expression.toString(), dotAll: true).hasMatch(value);
 }
 
+int? _secureDeleteInput(Object? value) {
+  if (value is bool) return value ? 1 : 0;
+  if (value is num) return value == 0 ? 0 : 1;
+  if (value is! String) return null;
+  return switch (value.toUpperCase()) {
+    'FAST' => 2,
+    'ON' || 'YES' || 'TRUE' => 1,
+    'OFF' || 'NO' || 'FALSE' => 0,
+    _ => switch (double.tryParse(value)) {
+      null => null,
+      0 => 0,
+      _ => 1,
+    },
+  };
+}
+
 int _asInt(Object? value) {
   if (value is int) return value;
   throw PureSqlException('expected integer, got $value');
@@ -16607,6 +16807,13 @@ class _Vacuum extends _Statement {
 
   final String? schema;
   final _Expr? into;
+}
+
+class _Reindex extends _Statement {
+  _Reindex(this.target, {this.schema});
+
+  final String? target;
+  final String? schema;
 }
 
 class _Insert extends _Statement {
@@ -17283,6 +17490,7 @@ class _Parser {
       'DROP' => _drop(),
       'ALTER' => _alterTable(),
       'ANALYZE' => _analyze(),
+      'REINDEX' => _reindex(),
       'VACUUM' => _vacuum(),
       'BEGIN' => _begin(),
       'COMMIT' => _commit(),
@@ -17294,6 +17502,7 @@ class _Parser {
       'DETACH' => _detach(),
       'PRAGMA' => _pragma(),
       'INSERT' => _insert(),
+      'REPLACE' => _insert(),
       'WITH' => _withStatement(),
       'SELECT' => _select(),
       'VALUES' => _select(),
@@ -17378,7 +17587,7 @@ class _Parser {
     _cteContext = Map.unmodifiable({...outerContext, ...ctes});
     return switch (_word) {
       'SELECT' || 'VALUES' => _select(),
-      'INSERT' => _insert(),
+      'INSERT' || 'REPLACE' => _insert(),
       'UPDATE' => _update(),
       'DELETE' => _delete(),
       _ => throw PureSqlException('WITH must precede SELECT or DML'),
@@ -17692,7 +17901,7 @@ class _Parser {
       while (_accept(';')) {}
       if (_acceptWord('END')) break;
       final step = switch (_word) {
-        'INSERT' => _insert(),
+        'INSERT' || 'REPLACE' => _insert(),
         'UPDATE' => _update(),
         'DELETE' => _delete(),
         'SELECT' || 'VALUES' => _select(),
@@ -17901,6 +18110,15 @@ class _Parser {
     return _Analyze(first);
   }
 
+  _Reindex _reindex() {
+    _expectWord('REINDEX');
+    if (_peek.type != _TokenType.word) return _Reindex(null);
+    final first = _identifier();
+    return _accept('.')
+        ? _Reindex(_identifier(), schema: first)
+        : _Reindex(first);
+  }
+
   _Vacuum _vacuum() {
     _expectWord('VACUUM');
     final schema = _peek.type == _TokenType.word && _word != 'INTO'
@@ -18040,9 +18258,10 @@ class _Parser {
   }
 
   _Statement _insert() {
-    _expectWord('INSERT');
-    var conflict = 'abort';
-    if (_acceptWord('OR')) {
+    final replace = _acceptWord('REPLACE');
+    if (!replace) _expectWord('INSERT');
+    var conflict = replace ? 'replace' : 'abort';
+    if (!replace && _acceptWord('OR')) {
       if (_acceptWord('IGNORE')) {
         conflict = 'ignore';
       } else if (_acceptWord('REPLACE')) {

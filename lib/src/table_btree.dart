@@ -67,12 +67,22 @@ class SqliteTableBtree {
     int pageStart = 0,
   }) {
     final existingChildren = _childPages(pager, rootPage, pageStart);
+    final oldTreePages = {rootPage, ...existingChildren};
+    final oldLeaves = existingChildren.isEmpty ? [rootPage] : existingChildren;
+    final oldOverflowPages = _overflowPages(
+      pager,
+      oldLeaves,
+      rootPage: rootPage,
+      pageStart: pageStart,
+      btreePages: oldTreePages,
+    );
     final pages = _pack(rows, pager.header.pageSize, pager, pageStart);
     if (pages.length == 1) {
       for (final child in existingChildren) {
         pager.freePage(child);
       }
       pager.writePage(rootPage, pages.single);
+      _freeUnusedOverflowPages(pager, rootPage, pageStart, oldOverflowPages);
       return;
     }
 
@@ -96,6 +106,73 @@ class SqliteTableBtree {
       rootPage,
       _interiorPage(pager.header.pageSize, childPages, pages, pageStart),
     );
+    _freeUnusedOverflowPages(pager, rootPage, pageStart, oldOverflowPages);
+  }
+
+  static void _freeUnusedOverflowPages(
+    SqlitePagerSync pager,
+    int rootPage,
+    int pageStart,
+    Set<int> oldOverflowPages,
+  ) {
+    final currentChildren = _childPages(pager, rootPage, pageStart);
+    final newTreePages = {rootPage, ...currentChildren};
+    final newOverflowPages = _overflowPages(
+      pager,
+      currentChildren.isEmpty ? [rootPage] : currentChildren,
+      rootPage: rootPage,
+      pageStart: pageStart,
+      btreePages: newTreePages,
+    );
+    for (final page in oldOverflowPages.difference(newOverflowPages)) {
+      pager.freePage(page);
+    }
+  }
+
+  static Set<int> _overflowPages(
+    SqlitePagerSync pager,
+    Iterable<int> leafPages, {
+    required int rootPage,
+    required Set<int> btreePages,
+    int pageStart = 0,
+  }) {
+    final overflowPages = <int>{};
+    for (final leaf in leafPages) {
+      final start = leaf == rootPage ? pageStart : 0;
+      final page = pager.readPage(leaf);
+      final count = _readU16(page, start + 3);
+      for (var index = 0; index < count; index++) {
+        final pointer = _readU16(page, start + 8 + index * 2);
+        final (payloadLength, payloadHeaderLength) = SqliteVarint.read(
+          page,
+          pointer,
+        );
+        final (_, rowIdLength) = SqliteVarint.read(
+          page,
+          pointer + payloadHeaderLength,
+        );
+        final payloadStart = pointer + payloadHeaderLength + rowIdLength;
+        final localLength = _localPayloadLength(
+          payloadLength,
+          pager.header.pageSize,
+        );
+        if (payloadLength == localLength) continue;
+        var next = _readU32(page, payloadStart + localLength);
+        var remaining = payloadLength - localLength;
+        while (remaining > 0) {
+          if (next < 2 ||
+              next > pager.pageCount ||
+              btreePages.contains(next) ||
+              !overflowPages.add(next)) {
+            throw SqliteFormatException('invalid overflow page: $next');
+          }
+          final overflow = pager.readPage(next);
+          remaining -= remaining.clamp(0, pager.header.pageSize - 4);
+          next = _readU32(overflow, 0);
+        }
+      }
+    }
+    return overflowPages;
   }
 
   static void freeTree(
