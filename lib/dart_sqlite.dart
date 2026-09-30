@@ -21,6 +21,44 @@ export 'src/index_btree.dart';
 
 /// A SQL result row, keyed by the selected column names.
 typedef SqlRow = Map<String, Object?>;
+
+/// A row exposed by a registered virtual-table module.
+class SqlVirtualTableRow {
+  const SqlVirtualTableRow(this.rowId, this.values);
+
+  final int rowId;
+  final SqlRow values;
+}
+
+/// A pure-Dart virtual-table instance supplied by a registered module.
+abstract class SqlVirtualTable {
+  /// Visible column names in SQLite result order.
+  List<String> get columns;
+
+  /// Reads the current rows. Row IDs must be unique signed 64-bit integers.
+  Iterable<SqlVirtualTableRow> scan();
+
+  /// Atomically replaces all rows after SQL DML. Omit to make the table read-only.
+  void replaceRows(List<SqlVirtualTableRow> rows) {
+    throw SqliteException('virtual table is read-only');
+  }
+
+  /// Releases the connection to this table. [destroy] is used by DROP TABLE.
+  void disconnect() {}
+  void destroy() => disconnect();
+}
+
+/// Creates or reconnects a pure-Dart virtual table from CREATE arguments.
+///
+/// [arguments] contains the original SQL text for each module argument.
+typedef SqlVirtualTableModule =
+    SqlVirtualTable Function(
+      PureDatabase database,
+      String schema,
+      String tableName,
+      List<String> arguments, {
+      required bool create,
+    });
 const _sqlFunctionsZoneKey = #pureSqliteFunctions;
 const _sqlAggregateFunctionsZoneKey = #pureSqliteAggregateFunctions;
 const _sqlWindowFunctionsZoneKey = #pureSqliteWindowFunctions;
@@ -42,6 +80,7 @@ const _supportedPragmaNames = {
   'case_sensitive_like',
   'collation_list',
   'compile_options',
+  'count_changes',
   'database_list',
   'default_cache_size',
   'defer_foreign_keys',
@@ -49,6 +88,7 @@ const _supportedPragmaNames = {
   'foreign_key_check',
   'foreign_key_list',
   'foreign_keys',
+  'full_column_names',
   'freelist_count',
   'function_list',
   'ignore_check_constraints',
@@ -70,6 +110,7 @@ const _supportedPragmaNames = {
   'recursive_triggers',
   'reverse_unordered_selects',
   'schema_version',
+  'short_column_names',
   'synchronous',
   'temp_store',
   'table_info',
@@ -137,9 +178,11 @@ const _connectionPragmaNames = {
   'case_sensitive_like',
   'collation_list',
   'compile_options',
+  'count_changes',
   'database_list',
   'defer_foreign_keys',
   'foreign_keys',
+  'full_column_names',
   'function_list',
   'ignore_check_constraints',
   'legacy_alter_table',
@@ -149,6 +192,7 @@ const _connectionPragmaNames = {
   'read_uncommitted',
   'recursive_triggers',
   'reverse_unordered_selects',
+  'short_column_names',
   'temp_store',
   'wal_autocheckpoint',
 };
@@ -172,9 +216,11 @@ const _writablePragmaNames = {
   'busy_timeout',
   'cache_size',
   'case_sensitive_like',
+  'count_changes',
   'default_cache_size',
   'defer_foreign_keys',
   'foreign_keys',
+  'full_column_names',
   'ignore_check_constraints',
   'journal_mode',
   'journal_size_limit',
@@ -185,6 +231,7 @@ const _writablePragmaNames = {
   'read_uncommitted',
   'recursive_triggers',
   'reverse_unordered_selects',
+  'short_column_names',
   'schema_version',
   'synchronous',
   'temp_store',
@@ -262,20 +309,43 @@ typedef PureSqlException = SqliteException;
 /// file. The supported SQL syntax is a subset of SQLite; unsupported
 /// statements throw [SqliteException].
 class PureDatabase {
-  PureDatabase._(Map<String, _Table> tables, [this._pager, this._onLog])
-    : _tables = tables,
-      _indexes = {},
-      _temporaryTables = {},
-      _temporaryIndexes = {},
-      _views = {},
-      _temporaryViews = {},
-      _triggers = {},
-      _temporaryTriggers = {},
-      _viewStack = {};
+  PureDatabase._(
+    Map<String, _Table> tables, [
+    this._pager,
+    this._onLog,
+    Map<String, SqlVirtualTableModule> virtualTableModules = const {},
+  ]) : _tables = tables,
+       _virtualTableModules = {
+         for (final entry in virtualTableModules.entries)
+           _key(entry.key): entry.value,
+       },
+       _indexes = {},
+       _temporaryTables = {},
+       _temporaryIndexes = {},
+       _views = {},
+       _temporaryViews = {},
+       _triggers = {},
+       _temporaryTriggers = {},
+       _viewStack = {};
 
   /// Creates an in-memory database that is discarded when closed.
-  factory PureDatabase.memory({SqlLogCallback? onLog}) =>
-      PureDatabase._({}, null, onLog).._journalMode = 'memory';
+  factory PureDatabase.memory({
+    SqlLogCallback? onLog,
+    Map<String, SqlVirtualTableModule> virtualTableModules = const {},
+  }) =>
+      PureDatabase._({}, null, onLog, virtualTableModules)
+        .._journalMode = 'memory';
+
+  /// Registers a pure-Dart module for subsequent `CREATE VIRTUAL TABLE` calls.
+  ///
+  /// Modules needed by existing persistent virtual tables must be supplied to
+  /// [open] before the database schema is loaded.
+  void registerVirtualTableModule(String name, SqlVirtualTableModule module) {
+    if (!RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$').hasMatch(name)) {
+      throw ArgumentError.value(name, 'name', 'must be a simple SQL name');
+    }
+    _virtualTableModules[_key(name)] = module;
+  }
 
   /// Registers or replaces a scalar SQL function.
   ///
@@ -378,9 +448,10 @@ class PureDatabase {
     String path, {
     Duration busyTimeout = Duration.zero,
     SqlLogCallback? onLog,
+    Map<String, SqlVirtualTableModule> virtualTableModules = const {},
   }) {
     final pager = SqlitePagerSync.open(path, busyTimeout: busyTimeout);
-    final database = PureDatabase._({}, pager, onLog)
+    final database = PureDatabase._({}, pager, onLog, virtualTableModules)
       .._journalMode = pager.isWalMode ? 'wal' : 'delete'
       .._busyTimeout = busyTimeout;
     try {
@@ -401,6 +472,7 @@ class PureDatabase {
   }
 
   Map<String, _Table> _tables;
+  final Map<String, SqlVirtualTableModule> _virtualTableModules;
   Map<String, _Index> _indexes;
   Map<String, _Table> _temporaryTables;
   Map<String, _Index> _temporaryIndexes;
@@ -408,6 +480,8 @@ class PureDatabase {
   Map<String, _CreateView> _temporaryViews;
   Map<String, _CreateTrigger> _triggers;
   final Map<String, _CreateTrigger> _temporaryTriggers;
+  final List<SqlVirtualTable> _pendingVirtualTableDestroy = [];
+  final Set<SqlVirtualTable> _dirtyVirtualTables = {};
   Iterable<_CreateTrigger> get _allTriggers => [
     ..._triggers.values,
     ..._temporaryTriggers.values,
@@ -440,6 +514,9 @@ class PureDatabase {
   var _schemaVersion = 1;
   var _analysisLimit = 0;
   var _automaticIndex = true;
+  var _countChanges = false;
+  var _fullColumnNames = false;
+  var _shortColumnNames = true;
   var _tempStore = 0;
   var _walAutoCheckpoint = 1000;
   var _journalMode = 'delete';
@@ -735,8 +812,18 @@ class PureDatabase {
               _deferForeignKeys = false;
             }
           }
+          if (_pager == null &&
+              !_inTransaction &&
+              _transactionCallbackDepth == 0) {
+            _dirtyVirtualTables.clear();
+          }
           return changed;
         } catch (_) {
+          if (_pager == null &&
+              !_inTransaction &&
+              _transactionCallbackDepth == 0) {
+            _dirtyVirtualTables.clear();
+          }
           if (!_inTransaction && isDml) _deferForeignKeys = false;
           rethrow;
         }
@@ -838,6 +925,7 @@ class PureDatabase {
 
   String? _qualifiedSchemaObject(_Statement statement) => switch (statement) {
     _CreateTable(:final name) ||
+    _CreateVirtualTable(:final name) ||
     _CreateTableAs(:final name) ||
     _CreateView(:final name) ||
     _CreateTrigger(:final name) ||
@@ -876,6 +964,19 @@ class PureDatabase {
           checkExpressions: checkExpressions,
           uniqueConstraints: uniqueConstraints,
           foreignKeyConstraints: foreignKeyConstraints,
+          temporary: temporary || isTemporary,
+        ),
+      _CreateVirtualTable(
+        :final module,
+        :final arguments,
+        :final ifNotExists,
+        temporary: final isTemporary,
+      ) =>
+        _CreateVirtualTable(
+          unqualified,
+          module,
+          arguments,
+          ifNotExists,
           temporary: temporary || isTemporary,
         ),
       _CreateTableAs(
@@ -948,9 +1049,10 @@ class PureDatabase {
         ifExists,
         schema: schema,
       ),
-      _AlterTable(:final column) => _AlterTable(
+      _AlterTable(:final column, :final definitionSql) => _AlterTable(
         unqualified,
         column,
+        definitionSql,
         schema: schema,
       ),
       _RenameTable(:final newName) => _RenameTable(
@@ -1127,6 +1229,7 @@ class PureDatabase {
 
   bool _isWriteStatement(_Statement statement) =>
       statement is _CreateTable ||
+      statement is _CreateVirtualTable ||
       statement is _CreateTableAs ||
       statement is _CreateView ||
       statement is _CreateTrigger ||
@@ -1211,6 +1314,12 @@ class PureDatabase {
           !_views.containsKey(_key(name)) &&
           !_indexes.containsKey(_key(name)) &&
           !_triggers.containsKey(_key(name)),
+    _CreateVirtualTable(:final name, :final temporary) =>
+      !temporary &&
+          !_tables.containsKey(_key(name)) &&
+          !_views.containsKey(_key(name)) &&
+          !_indexes.containsKey(_key(name)) &&
+          !_triggers.containsKey(_key(name)),
     _CreateView(:final name, :final temporary) =>
       !temporary &&
           !_views.containsKey(_key(name)) &&
@@ -1273,6 +1382,7 @@ class PureDatabase {
 
   bool _changesTemporarySchema(_Statement statement) => switch (statement) {
     _CreateTable(:final name, temporary: true) ||
+    _CreateVirtualTable(:final name, temporary: true) ||
     _CreateTableAs(:final name, temporary: true) ||
     _CreateView(:final name, temporary: true) ||
     _CreateTrigger(:final name, temporary: true) ||
@@ -1312,6 +1422,7 @@ class PureDatabase {
 
   bool _opensTemporaryDatabase(_Statement statement) => switch (statement) {
     _CreateTable(temporary: true) ||
+    _CreateVirtualTable(temporary: true) ||
     _CreateTableAs(temporary: true) ||
     _CreateView(temporary: true) ||
     _CreateTrigger(temporary: true) ||
@@ -1331,7 +1442,7 @@ class PureDatabase {
     pager.writePage(1, pager.readPage(1));
   }
 
-  /// Runs a `SELECT`, read-only `PRAGMA`, or DML statement with `RETURNING`.
+  /// Runs a `SELECT`, read-only `PRAGMA`, or DML with `RETURNING`/count_changes.
   ///
   /// Bind positional placeholders with a list and named placeholders with a map.
   List<SqlRow> select(String sql, [Object? parameters = const []]) {
@@ -1385,11 +1496,24 @@ class PureDatabase {
         () => _withSqlFunctions(() => _pragmaRows(statement, values)),
       );
     }
-    if (statement is _Insert && statement.returning != null ||
+    final isDml =
+        statement is _Insert || statement is _Update || statement is _Delete;
+    final hasReturning =
+        statement is _Insert && statement.returning != null ||
         statement is _Update && statement.returning != null ||
-        statement is _Delete && statement.returning != null) {
-      _executeOne(sql, parameters);
-      return List<SqlRow>.from(_lastReturningRows);
+        statement is _Delete && statement.returning != null;
+    if (isDml && (hasReturning || _countChanges)) {
+      final changed = _executeOne(sql, parameters);
+      if (hasReturning) return List<SqlRow>.from(_lastReturningRows);
+      final columnName = switch (statement) {
+        _Insert() => 'rows inserted',
+        _Update() => 'rows updated',
+        _Delete() => 'rows deleted',
+        _ => throw StateError('DML statement expected'),
+      };
+      return [
+        <String, Object?>{columnName: changed},
+      ];
     }
     if (statement is! _Select) {
       throw PureSqlException('Only SELECT can be used with select()');
@@ -1409,6 +1533,7 @@ class PureDatabase {
       );
       final before = _cloneTables(_tables);
       final beforeTemporary = _cloneTables(_temporaryTables);
+      final modulesBefore = _virtualTableInstances();
       final beforeViews = Map<String, _CreateView>.of(_views);
       final beforeTemporaryViews = Map<String, _CreateView>.of(_temporaryViews);
       final beforeTriggers = Map<String, _CreateTrigger>.of(_triggers);
@@ -1418,8 +1543,14 @@ class PureDatabase {
       final beforeSchemaVersion = _schemaVersion;
       _transactionCallbackDepth++;
       try {
-        return action(this);
+        final result = action(this);
+        _finishVirtualTableDrops(commit: true);
+        _dirtyVirtualTables.clear();
+        return result;
       } catch (_) {
+        final modulesAfter = _virtualTableInstances();
+        _restoreVirtualTableSnapshots(before);
+        _restoreVirtualTableSnapshots(beforeTemporary);
         _tables = before;
         _temporaryTables = beforeTemporary;
         _views = beforeViews;
@@ -1438,6 +1569,15 @@ class PureDatabase {
             for (final index in table.indexes) _key(index.name): index,
         };
         _schemaVersion = beforeSchemaVersion;
+        final modulesRestored = _virtualTableInstances();
+        for (final module in {...modulesBefore, ...modulesAfter}) {
+          if (!modulesRestored.contains(module) &&
+              !_pendingVirtualTableDestroy.contains(module)) {
+            _disposeVirtualTable(module);
+          }
+        }
+        _finishVirtualTableDrops(commit: false);
+        _dirtyVirtualTables.clear();
         rethrow;
       } finally {
         _transactionCallbackDepth--;
@@ -1460,6 +1600,7 @@ class PureDatabase {
   int _execute(_Statement statement, List<Object?> values, String sql) =>
       switch (statement) {
         _CreateTable() => _create(statement, sql: sql),
+        _CreateVirtualTable() => _createVirtualTable(statement, sql: sql),
         _CreateTableAs() => _createTableAs(statement, values),
         _CreateView() => _createView(statement, sql: sql),
         _CreateTrigger() => _createTrigger(statement, sql: sql),
@@ -1543,8 +1684,16 @@ class PureDatabase {
     }
     if (memory) displayFilename = '';
     final database = memory
-        ? PureDatabase.memory(onLog: _onLog)
-        : PureDatabase.open(path, busyTimeout: _busyTimeout, onLog: _onLog);
+        ? PureDatabase.memory(
+            onLog: _onLog,
+            virtualTableModules: _virtualTableModules,
+          )
+        : PureDatabase.open(
+            path,
+            busyTimeout: _busyTimeout,
+            onLog: _onLog,
+            virtualTableModules: _virtualTableModules,
+          );
     if (readOnly) {
       database
         .._readOnly = true
@@ -1603,13 +1752,28 @@ class PureDatabase {
     _ensureUniqueSelectOutputNames(statement.query);
     final rows = _select(statement.query, parameters);
     final names = _materializedColumnNames(statement.query, rows, parameters);
+    final definitions = _queryColumnDefinitions(statement.query, parameters);
+    final typeNames = definitions.length == names.length
+        ? [for (final definition in definitions) definition.typeName]
+        : const <String?>[];
     final quoted = (String name) => '"${name.replaceAll('"', '""')}"';
+    final columns = [
+      for (var index = 0; index < names.length; index++)
+        _ColumnDef(
+          names[index],
+          typeName: index < typeNames.length ? typeNames[index] : null,
+        ),
+    ];
     final schemaSql =
-        'CREATE TABLE ${quoted(statement.name)} (${names.map(quoted).join(', ')})';
+        'CREATE TABLE ${quoted(statement.name)} ('
+        '${columns.map((column) {
+          final type = column.typeName;
+          return '${quoted(column.name)}${type == null || type.isEmpty ? '' : ' $type'}';
+        }).join(', ')})';
     _create(
       _CreateTable(
         statement.name,
-        [for (final name in names) _ColumnDef(name)],
+        columns,
         false,
         temporary: statement.temporary,
       ),
@@ -1623,6 +1787,273 @@ class PureDatabase {
       const [],
     );
   }
+
+  List<_ColumnDef> _queryColumnDefinitions(
+    _Select query,
+    List<Object?> parameters, [
+    Set<_Select>? active,
+  ]) {
+    active ??= <_Select>{};
+    if (!active.add(query)) {
+      return [for (final item in query.items) _ColumnDef(item.outputName)];
+    }
+    try {
+      final sources =
+          <({String name, String? alias, List<_ColumnDef> columns})>[
+            if (query.fromQuery != null)
+              (
+                name: query.alias ?? '(subquery)',
+                alias: query.alias,
+                columns: _queryColumnDefinitions(
+                  query.fromQuery!,
+                  parameters,
+                  active,
+                ),
+              )
+            else if (query.tableFunction != null)
+              (
+                name: query.tableFunction!.name,
+                alias: query.alias,
+                columns: _tableFunctionColumns(query.tableFunction!.name),
+              )
+            else if (query.table != null)
+              (
+                name: query.table!,
+                alias: query.alias,
+                columns: _sourceColumnDefinitions(
+                  query.table!,
+                  query.ctes,
+                  parameters,
+                  active,
+                ),
+              ),
+            for (final join in query.joins)
+              (
+                name: join.tableFunction?.name ?? join.table ?? '(subquery)',
+                alias: join.alias,
+                columns: join.tableFunction != null
+                    ? _tableFunctionColumns(join.tableFunction!.name)
+                    : join.query != null
+                    ? _queryColumnDefinitions(join.query!, parameters, active)
+                    : _sourceColumnDefinitions(
+                        join.table!,
+                        query.ctes,
+                        parameters,
+                        active,
+                      ),
+              ),
+          ];
+      final result = <_ColumnDef>[];
+      for (final item in query.items) {
+        if (item.expression case _Column(
+          :final name,
+        ) when name == '*' || name.endsWith('.*')) {
+          final qualifier = name == '*'
+              ? null
+              : name.substring(0, name.length - 2);
+          final selectedSources = qualifier == null
+              ? sources
+              : sources.where(
+                  (source) =>
+                      _key(source.alias ?? _sourceLeaf(source.name)) ==
+                      _key(qualifier),
+                );
+          if (qualifier != null && selectedSources.isEmpty) {
+            return [];
+          }
+          for (final source in selectedSources) {
+            for (final column in source.columns) {
+              result.add(
+                _ColumnDef(
+                  column.name,
+                  typeName: _ctasDeclaredType(column.typeName ?? ''),
+                ),
+              );
+            }
+          }
+        } else {
+          result.add(
+            _ColumnDef(
+              item.outputName,
+              typeName: _queryExpressionTypeName(
+                item.expression,
+                sources,
+                parameters,
+                active,
+              ),
+            ),
+          );
+        }
+      }
+      return result;
+    } finally {
+      active.remove(query);
+    }
+  }
+
+  String _queryExpressionTypeName(
+    _Expr expression,
+    List<({String name, String? alias, List<_ColumnDef> columns})> sources,
+    List<Object?> parameters,
+    Set<_Select> active,
+  ) {
+    if (expression is _Cast) return _ctasDeclaredType(expression.type);
+    if (expression is _ScalarSubquery) {
+      final columns = _queryColumnDefinitions(
+        expression.query,
+        parameters,
+        active,
+      );
+      return columns.isEmpty ? '' : columns.first.typeName ?? '';
+    }
+    if (expression is! _Column ||
+        expression.name == '*' ||
+        expression.name.endsWith('.*')) {
+      return '';
+    }
+    final separator = expression.name.lastIndexOf('.');
+    final columnName = separator < 0
+        ? expression.name
+        : expression.name.substring(separator + 1);
+    final qualifier = separator < 0
+        ? null
+        : expression.name.substring(0, separator);
+    final candidates = sources.where((source) {
+      if (qualifier != null &&
+          _key(source.alias ?? _sourceLeaf(source.name)) != _key(qualifier)) {
+        return false;
+      }
+      return source.columns.any(
+            (column) => _key(column.name) == _key(columnName),
+          ) ||
+          const {'rowid', '_rowid_', 'oid'}.contains(_key(columnName)) &&
+              source.columns.every(
+                (column) => _key(column.name) != _key(columnName),
+              );
+    }).toList();
+    if (candidates.length != 1) return '';
+    final column = candidates.single.columns.where(
+      (column) => _key(column.name) == _key(columnName),
+    );
+    return column.isEmpty
+        ? 'INT'
+        : _ctasDeclaredType(column.single.typeName ?? '');
+  }
+
+  List<_ColumnDef> _sourceColumnDefinitions(
+    String name,
+    Map<String, _Cte> ctes,
+    List<Object?> parameters,
+    Set<_Select> active,
+  ) {
+    final separator = name.indexOf('\u0000');
+    if (separator >= 0) {
+      return _schemaColumnDefinitions(
+        name.substring(0, separator),
+        name.substring(separator + 1),
+        parameters,
+        active,
+      );
+    }
+    final key = _key(name);
+    final recursive = _recursiveCteTables[key];
+    if (recursive != null) return recursive.columns;
+    final cte = ctes[key];
+    if (cte != null) {
+      final columns = _queryColumnDefinitions(cte.query, parameters, active);
+      return _renameColumnDefinitions(columns, cte.columns);
+    }
+    final queryContext = _attachedQueryContext;
+    if (queryContext != null) {
+      return queryContext._sourceColumnDefinitions(
+        name,
+        ctes,
+        parameters,
+        active,
+      );
+    }
+    final temporary = _temporaryTables[key];
+    if (temporary != null) return temporary.columns;
+    final temporaryView = _temporaryViews[key];
+    if (temporaryView != null) {
+      return _viewColumnDefinitions(temporaryView, parameters, active);
+    }
+    final main = _mainColumnDefinitions(name, parameters, active);
+    if (main.isNotEmpty) return main;
+    for (final attached in _attachedDatabases.values) {
+      final columns = attached.database._mainColumnDefinitions(
+        name,
+        parameters,
+        active,
+      );
+      if (columns.isNotEmpty) return columns;
+    }
+    return const [];
+  }
+
+  List<_ColumnDef> _schemaColumnDefinitions(
+    String schema,
+    String name,
+    List<Object?> parameters,
+    Set<_Select> active,
+  ) {
+    switch (_key(schema)) {
+      case 'main':
+        return (_schemaMainOverride ?? this)._mainColumnDefinitions(
+          name,
+          parameters,
+          active,
+        );
+      case 'temp':
+        final database = _schemaTempOverride ?? this;
+        final table = database._temporaryTables[_key(name)];
+        if (table != null) return table.columns;
+        final view = database._temporaryViews[_key(name)];
+        return view == null
+            ? const []
+            : database._viewColumnDefinitions(view, parameters, active);
+      default:
+        final attached = _attachedDatabases[_key(schema)];
+        return attached?.database._mainColumnDefinitions(
+              name,
+              parameters,
+              active,
+            ) ??
+            const [];
+    }
+  }
+
+  List<_ColumnDef> _mainColumnDefinitions(
+    String name,
+    List<Object?> parameters,
+    Set<_Select> active,
+  ) {
+    final table = _tables[_key(name)];
+    if (table != null) return table.columns;
+    final view = _views[_key(name)];
+    return view == null
+        ? const []
+        : _viewColumnDefinitions(view, parameters, active);
+  }
+
+  List<_ColumnDef> _viewColumnDefinitions(
+    _CreateView view,
+    List<Object?> parameters,
+    Set<_Select> active,
+  ) => _renameColumnDefinitions(
+    _queryColumnDefinitions(view.query, parameters, active),
+    view.columns,
+  );
+
+  List<_ColumnDef> _renameColumnDefinitions(
+    List<_ColumnDef> columns,
+    List<String>? names,
+  ) => names == null || names.length != columns.length
+      ? columns
+      : [
+          for (var index = 0; index < names.length; index++)
+            _ColumnDef(names[index], typeName: columns[index].typeName),
+        ];
 
   void _ensureUniqueSelectOutputNames(_Select query, [Set<_Select>? visited]) {
     visited ??= <_Select>{};
@@ -1640,7 +2071,11 @@ class PureDatabase {
         suffix++;
       }
       if (candidate != item.outputName) {
-        query.items[index] = _SelectItem(item.expression, candidate);
+        query.items[index] = _SelectItem(
+          item.expression,
+          candidate,
+          explicitAlias: true,
+        );
       }
     }
     for (final term in query.compoundTerms) {
@@ -1713,6 +2148,7 @@ class PureDatabase {
         }
       }
     }
+    _memoryTransactionTables ??= _cloneTables(_tables);
     _memoryTransactionTemporaryTables ??= _cloneTables(_temporaryTables);
     _memoryTransactionTemporaryViews ??= Map.of(_temporaryViews);
     _transactionTemporaryTriggers ??= Map.of(_temporaryTriggers);
@@ -1750,6 +2186,8 @@ class PureDatabase {
         if (_synchronous == 1) _pager?.syncDatabase();
         _transactionJournal?.commit(sizeLimit: _journalSizeLimit);
       }
+      _finishVirtualTableDrops(commit: true);
+      _dirtyVirtualTables.clear();
     } catch (_) {
       if (_inTransaction) _rollback();
       rethrow;
@@ -1796,6 +2234,12 @@ class PureDatabase {
         }
       }
     }
+    if (_memoryTransactionTables case final snapshot?) {
+      _restoreVirtualTableSnapshots(snapshot);
+    }
+    if (_memoryTransactionTemporaryTables case final snapshot?) {
+      _restoreVirtualTableSnapshots(snapshot);
+    }
     if (_pager == null) {
       _tables = _memoryTransactionTables!;
       _temporaryTables = _memoryTransactionTemporaryTables!;
@@ -1818,7 +2262,7 @@ class PureDatabase {
     } else if (_walTransaction) {
       try {
         _pager!.rollbackWalTransaction();
-        _refreshFile();
+        _refreshFile(virtualTableSources: _memoryTransactionTables);
       } finally {
         _memoryTransactionTables = null;
         _temporaryTables = _memoryTransactionTemporaryTables!;
@@ -1848,7 +2292,7 @@ class PureDatabase {
           databaseHandle: _pager!.databaseHandle,
           sizeLimit: _journalSizeLimit,
         );
-        _refreshFile();
+        _refreshFile(virtualTableSources: _memoryTransactionTables);
       } finally {
         _transactionJournal = null;
         _memoryTransactionTables = null;
@@ -1889,6 +2333,8 @@ class PureDatabase {
     _memoryTransactionTemporaryPragmaValues = null;
     _inTransaction = false;
     _transactionAttachedDatabases.clear();
+    _finishVirtualTableDrops(commit: false);
+    _dirtyVirtualTables.clear();
     if (attachedRollbackError != null) throw attachedRollbackError;
     return 0;
   }
@@ -1918,6 +2364,8 @@ class PureDatabase {
           userVersion: _userVersion,
           memoryPageSize: _memoryPageSize,
           temporaryPragmaValues: Map.of(_temporaryPragmaValues),
+          pendingVirtualTableDestroy: List.of(_pendingVirtualTableDestroy),
+          dirtyVirtualTables: Set.of(_dirtyVirtualTables),
         ),
       );
     } catch (_) {
@@ -1939,6 +2387,10 @@ class PureDatabase {
     );
     if (index < 0) throw PureSqlException('no such savepoint: $name');
     final savepoint = _savepoints[index];
+    final modulesBefore = {
+      ..._virtualTableInstances(),
+      ..._pendingVirtualTableDestroy,
+    };
     for (final attached in _attachedDatabases.values) {
       if (attached.database._savepoints.any(
         (candidate) => _key(candidate.name) == _key(name),
@@ -1946,9 +2398,11 @@ class PureDatabase {
         attached.database._rollbackTo(name);
       }
     }
+    _restoreVirtualTableSnapshots(savepoint.tables);
+    _restoreVirtualTableSnapshots(savepoint.temporaryTables);
     if (_pager != null) {
       _pager!.rollbackToSavepoint(savepoint.pager!);
-      _refreshFile();
+      _refreshFile(virtualTableSources: savepoint.tables);
     } else {
       _tables = _cloneTables(savepoint.tables);
       _indexes = {
@@ -1970,6 +2424,19 @@ class PureDatabase {
     _temporaryTriggers
       ..clear()
       ..addAll(savepoint.temporaryTriggers);
+    _pendingVirtualTableDestroy
+      ..clear()
+      ..addAll(savepoint.pendingVirtualTableDestroy);
+    _dirtyVirtualTables
+      ..clear()
+      ..addAll(savepoint.dirtyVirtualTables);
+    final modulesRestored = _virtualTableInstances();
+    for (final module in modulesBefore) {
+      if (!modulesRestored.contains(module) &&
+          !savepoint.pendingVirtualTableDestroy.contains(module)) {
+        _disposeVirtualTable(module);
+      }
+    }
     if (_pager == null) _memoryPageSize = savepoint.memoryPageSize;
     _restoreTemporaryPragmas(savepoint.temporaryPragmaValues);
     _savepoints.removeRange(index + 1, _savepoints.length);
@@ -1994,7 +2461,11 @@ class PureDatabase {
     return 0;
   }
 
-  T _journalled<T>(T Function() action, {String? journalMode}) {
+  T _journalled<T>(
+    T Function() action, {
+    String? journalMode,
+    Map<String, _Table>? virtualTableSources,
+  }) {
     final journal = SqliteRollbackJournal.begin(
       _pager!.path,
       databaseHandle: _pager!.databaseHandle,
@@ -2013,7 +2484,7 @@ class PureDatabase {
         databaseHandle: _pager!.databaseHandle,
         sizeLimit: _journalSizeLimit,
       );
-      _refreshFile();
+      _refreshFile(virtualTableSources: virtualTableSources);
       rethrow;
     }
   }
@@ -2026,13 +2497,24 @@ class PureDatabase {
         try {
           _refreshFile();
           if (!pager.isWalMode) continue;
+          final virtualTableSnapshot = _cloneVirtualTables(_tables);
+          final temporaryVirtualTableSnapshot = _cloneVirtualTables(
+            _temporaryTables,
+          );
           pager.beginWalTransaction();
           try {
             final result = action();
             pager.commitWalTransaction();
+            _finishVirtualTableDrops(commit: true);
+            _dirtyVirtualTables.clear();
             return result;
           } catch (_) {
             pager.rollbackWalTransaction();
+            _restoreVirtualTableSnapshots(virtualTableSnapshot);
+            _restoreVirtualTableSnapshots(temporaryVirtualTableSnapshot);
+            _refreshFile(virtualTableSources: virtualTableSnapshot);
+            _finishVirtualTableDrops(commit: false);
+            _dirtyVirtualTables.clear();
             rethrow;
           }
         } finally {
@@ -2043,7 +2525,25 @@ class PureDatabase {
       try {
         _refreshFile();
         if (pager.isWalMode) continue;
-        return _journalled(action);
+        final virtualTableSnapshot = _cloneVirtualTables(_tables);
+        final temporaryVirtualTableSnapshot = _cloneVirtualTables(
+          _temporaryTables,
+        );
+        try {
+          final result = _journalled(
+            action,
+            virtualTableSources: virtualTableSnapshot,
+          );
+          _finishVirtualTableDrops(commit: true);
+          _dirtyVirtualTables.clear();
+          return result;
+        } catch (_) {
+          _restoreVirtualTableSnapshots(virtualTableSnapshot);
+          _restoreVirtualTableSnapshots(temporaryVirtualTableSnapshot);
+          _finishVirtualTableDrops(commit: false);
+          _dirtyVirtualTables.clear();
+          rethrow;
+        }
       } finally {
         pager.releaseExclusiveLock();
       }
@@ -2114,16 +2614,169 @@ class PureDatabase {
     },
   );
 
-  void _refreshFile() {
+  void _refreshFile({Map<String, _Table>? virtualTableSources}) {
     _pager!.refresh();
     _applicationId = _pager!.header.applicationId;
     _userVersion = _pager!.header.userVersion;
     _schemaVersion = _pager!.header.schemaCookie;
+    final previousTables = _tables;
+    final reusableTables = virtualTableSources ?? previousTables;
     _tables = {};
     _indexes = {};
     _views = {};
     _triggers = {};
-    _loadFile();
+    _loadFile(reusableTables);
+    final retainedModules = {
+      for (final table in _tables.values)
+        if (table.virtualTable case final module?) module,
+    };
+    for (final table in {...previousTables.values, ...reusableTables.values}) {
+      final module = table.virtualTable;
+      if (module != null && !retainedModules.contains(module)) {
+        _disposeVirtualTable(module);
+      }
+    }
+  }
+
+  void _refreshVirtualTableRows(_Table table) {
+    final module = table.virtualTable;
+    if (module == null) return;
+    final ids = <int>{};
+    final rows = <SqlRow>[];
+    final rowIds = <int>[];
+    for (final source in module.scan()) {
+      if (source.rowId < -0x8000000000000000 ||
+          source.rowId > 0x7fffffffffffffff ||
+          !ids.add(source.rowId)) {
+        throw PureSqlException('invalid or duplicate virtual-table rowid');
+      }
+      rows.add({
+        for (final column in table.columns)
+          column.name: _virtualTableValue(source.values, column.name),
+      });
+      rowIds.add(source.rowId);
+    }
+    var nextRowId = 1;
+    while (ids.contains(nextRowId) && nextRowId < 0x7fffffffffffffff) {
+      nextRowId++;
+    }
+    table.rows
+      ..clear()
+      ..addAll(rows);
+    table.rowIds
+      ..clear()
+      ..addAll(rowIds);
+    table.nextRowId = nextRowId;
+  }
+
+  _Table _currentTable(_Table table) {
+    _refreshVirtualTableRows(table);
+    return table;
+  }
+
+  Object? _virtualTableValue(SqlRow values, String column) {
+    if (values.containsKey(column)) return values[column];
+    for (final entry in values.entries) {
+      if (_key(entry.key) == _key(column)) return entry.value;
+    }
+    return null;
+  }
+
+  bool _virtualRowsMatch(
+    _Table table,
+    SqlVirtualTable module,
+    List<SqlVirtualTableRow> expected,
+  ) {
+    final actual = module.scan().toList();
+    if (actual.length != expected.length) return false;
+    final byId = {for (final row in actual) row.rowId: row};
+    if (byId.length != actual.length) return false;
+    for (var index = 0; index < expected.length; index++) {
+      final wanted = expected[index];
+      final found = byId[wanted.rowId];
+      if (found == null) return false;
+      for (final column in table.columns) {
+        if (!_valueEqual(
+          _virtualTableValue(found.values, column.name),
+          wanted.values[column.name],
+        )) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  void _restoreVirtualTableState(
+    _Table table,
+    List<SqlRow> rows,
+    List<int> rowIds,
+  ) {
+    final module = table.virtualTable;
+    if (module == null) return;
+    final expected = [
+      for (var index = 0; index < rows.length; index++)
+        SqlVirtualTableRow(
+          rowIds[index],
+          Map<String, Object?>.from(rows[index]),
+        ),
+    ];
+    if (!_virtualRowsMatch(table, module, expected))
+      module.replaceRows(expected);
+  }
+
+  void _restoreVirtualTableSnapshots(Map<String, _Table> snapshot) {
+    for (final table in snapshot.values) {
+      if (table.virtualTable case final module?
+          when _dirtyVirtualTables.contains(module)) {
+        _restoreVirtualTableState(table, table.rows, table.rowIds);
+      }
+    }
+  }
+
+  void _disposeVirtualTable(SqlVirtualTable module, {bool destroy = false}) {
+    try {
+      if (destroy) {
+        module.destroy();
+      } else {
+        module.disconnect();
+      }
+    } catch (_) {}
+  }
+
+  Map<String, _Table> _cloneVirtualTables(Map<String, _Table> tables) => {
+    for (final entry in tables.entries)
+      if (entry.value.virtualTable != null) entry.key: entry.value.copy(),
+  };
+
+  void _finishVirtualTableDrops({required bool commit}) {
+    final active = {
+      for (final table in [..._tables.values, ..._temporaryTables.values])
+        if (table.virtualTable case final module?) module,
+    };
+    for (final module in _pendingVirtualTableDestroy) {
+      if (commit) {
+        _disposeVirtualTable(module, destroy: true);
+      } else if (!active.contains(module)) {
+        _disposeVirtualTable(module);
+      }
+    }
+    _pendingVirtualTableDestroy.clear();
+  }
+
+  Set<SqlVirtualTable> _virtualTableInstances() => {
+    for (final table in [..._tables.values, ..._temporaryTables.values])
+      if (table.virtualTable case final module?) module,
+  };
+
+  void _dropVirtualTable(_Table table) {
+    final module = table.virtualTable;
+    if (module == null) return;
+    if (_pager == null && !_inTransaction && _transactionCallbackDepth == 0) {
+      _disposeVirtualTable(module, destroy: true);
+    } else if (!_pendingVirtualTableDestroy.contains(module)) {
+      _pendingVirtualTableDestroy.add(module);
+    }
   }
 
   void _ensureSequenceTable() {
@@ -2285,6 +2938,72 @@ class PureDatabase {
     return 0;
   }
 
+  int _createVirtualTable(
+    _CreateVirtualTable statement, {
+    required String sql,
+  }) {
+    final key = _key(statement.name);
+    final tables = statement.temporary ? _temporaryTables : _tables;
+    final indexes = statement.temporary ? _temporaryIndexes : _indexes;
+    final triggers = statement.temporary ? _temporaryTriggers : _triggers;
+    final views = statement.temporary ? _temporaryViews : _views;
+    if (tables.containsKey(key) ||
+        indexes.containsKey(key) ||
+        triggers.containsKey(key) ||
+        views.containsKey(key)) {
+      if (statement.ifNotExists) return 0;
+      throw PureSqlException('table already exists: ${statement.name}');
+    }
+    final moduleFactory = _virtualTableModules[_key(statement.module)];
+    if (moduleFactory == null) {
+      throw PureSqlException('no such module: ${statement.module}');
+    }
+    final module = moduleFactory(
+      this,
+      statement.temporary ? 'temp' : 'main',
+      statement.name,
+      statement.arguments,
+      create: true,
+    );
+    try {
+      final columns = List<String>.from(module.columns);
+      final names = <String>{};
+      if (columns.isEmpty) {
+        throw PureSqlException(
+          'virtual tables must expose at least one column',
+        );
+      }
+      for (final column in columns) {
+        if (column.isEmpty || !names.add(_key(column))) {
+          throw PureSqlException('invalid virtual-table column: $column');
+        }
+      }
+      final table = _Table(
+        statement.name,
+        [for (final column in columns) _ColumnDef(column)],
+        rootPage: _pager == null || statement.temporary ? null : 0,
+        virtualTable: module,
+        schemaSql: sql.trim(),
+        isTemporary: statement.temporary,
+      );
+      _refreshVirtualTableRows(table);
+      if (_pager != null && !statement.temporary) {
+        SqliteTableBtree.insertRow(_pager!, 1, _nextSchemaRowId(), [
+          'table',
+          statement.name,
+          statement.name,
+          0,
+          sql.trim(),
+        ], pageStart: 100);
+      }
+      tables[key] = table;
+      return 0;
+    } catch (_) {
+      _disposeVirtualTable(module);
+      rethrow;
+    }
+  }
+
   int _createView(_CreateView statement, {required String sql}) {
     final key = _key(statement.name);
     final views = statement.temporary ? _temporaryViews : _views;
@@ -2363,6 +3082,9 @@ class PureDatabase {
         ? _table(statement.table)
         : _tables[tableKey] ??
               (throw PureSqlException('no such table: ${statement.table}'));
+    if (table.virtualTable != null) {
+      throw PureSqlException('virtual tables cannot have triggers');
+    }
     for (final column in statement.updateOf) {
       table.column(column);
     }
@@ -2387,6 +3109,9 @@ class PureDatabase {
     final oldKey = _key(statement.table);
     final newKey = _key(statement.newName);
     final table = _table(statement.table, schema: statement.schema);
+    if (table.virtualTable != null) {
+      throw PureSqlException('ALTER TABLE is not supported for virtual tables');
+    }
     if (table.isTemporary) {
       return _renameTemporaryTable(table, oldKey, statement.newName);
     }
@@ -2668,6 +3393,9 @@ class PureDatabase {
 
   int _renameColumn(_RenameColumn statement) {
     final table = _table(statement.table, schema: statement.schema);
+    if (table.virtualTable != null) {
+      throw PureSqlException('ALTER TABLE is not supported for virtual tables');
+    }
     final column = table.column(statement.oldName);
     if (table.columns.any(
       (other) => _key(other.name) == _key(statement.newName),
@@ -3331,6 +4059,9 @@ class PureDatabase {
 
   int _dropColumn(_DropColumn statement) {
     final table = _table(statement.table, schema: statement.schema);
+    if (table.virtualTable != null) {
+      throw PureSqlException('ALTER TABLE is not supported for virtual tables');
+    }
     final column = table.column(statement.name);
     for (final trigger in _allTriggers) {
       if (table.isTemporary && !trigger.temporary) continue;
@@ -3407,24 +4138,6 @@ class PureDatabase {
             'cannot drop a column referenced by a foreign key',
           );
         }
-      }
-    }
-    for (final view in [..._views.values, ..._temporaryViews.values]) {
-      if (table.isTemporary && !view.temporary) continue;
-      final viewSql = view.schemaSql;
-      if (viewSql == null) throw SqliteFormatException('missing view SQL');
-      final readsTable =
-          _renameSqlIdentifiersAfter(
-            viewSql,
-            table.name,
-            '__drop_probe__',
-            'source',
-          ) !=
-          viewSql;
-      if (readsTable &&
-          (_selectReferencesColumn(view.query, column.name) ||
-              _selectHasWildcard(view.query))) {
-        throw PureSqlException('cannot drop a column referenced by a view');
       }
     }
     final oldSql = table.schemaSql;
@@ -3560,31 +4273,63 @@ class PureDatabase {
 
   int _alterTable(_AlterTable statement, {required String sql}) {
     final table = _table(statement.table, schema: statement.schema);
+    if (table.virtualTable != null) {
+      throw PureSqlException('ALTER TABLE is not supported for virtual tables');
+    }
+    final column = statement.column;
+    final defaultExpression = column.defaultExpression;
+    final defaultIsNull =
+        defaultExpression == null ||
+        defaultExpression is _Literal && defaultExpression.value == null;
+    if (column.primaryKey || column.unique || column.autoIncrement) {
+      throw PureSqlException('cannot add a PRIMARY KEY or UNIQUE column');
+    }
     try {
-      table.column(statement.column.name);
-      throw PureSqlException('duplicate column name: ${statement.column.name}');
+      table.column(column.name);
+      throw PureSqlException('duplicate column name: ${column.name}');
     } on PureSqlException catch (error) {
       if (!error.message.startsWith('no such column:')) rethrow;
     }
-    if (statement.column.notNull &&
-        table.rows.isNotEmpty &&
-        statement.column.defaultExpression == null) {
+    if (column.notNull && table.rows.isNotEmpty && defaultIsNull) {
       throw PureSqlException(
         'cannot add a NOT NULL column with existing null values',
       );
     }
-    table.columns.add(statement.column);
+    if (column.defaultExpression != null &&
+        column.defaultExpression is! _Literal) {
+      throw PureSqlException('cannot add a column with non-constant default');
+    }
+    if (_foreignKeys && column.referencesTable != null && !defaultIsNull) {
+      throw PureSqlException(
+        'cannot add a REFERENCES column with non-NULL default value',
+      );
+    }
+    final defaultValue = defaultExpression == null
+        ? null
+        : _eval(defaultExpression, const {}, const []);
+    if (!_ignoreCheckConstraints) {
+      for (final row in table.rows) {
+        final candidate = {...row, column.name: defaultValue};
+        for (final check in column.checkExpressions) {
+          final value = _eval(check, candidate, const []);
+          if (value != null && !_truthy(value)) {
+            throw PureSqlException(
+              'CHECK constraint failed: ${table.name}.${column.name}',
+            );
+          }
+        }
+      }
+    }
+    table.columns.add(column);
     for (final row in table.rows) {
-      row[statement.column.name] = statement.column.defaultExpression == null
-          ? null
-          : _eval(statement.column.defaultExpression!, const {}, const []);
+      row[column.name] = defaultValue;
     }
     final oldSql = table.schemaSql;
     if (oldSql == null) throw SqliteFormatException('missing table SQL');
     final close = oldSql.lastIndexOf(')');
     if (close < 0) throw SqliteFormatException('invalid CREATE TABLE SQL');
     table.schemaSql =
-        '${oldSql.substring(0, close)}, ${_columnSql(statement.column)})';
+        '${oldSql.substring(0, close)}, ${statement.definitionSql})';
     final pager = _pager;
     if (pager != null && !table.isTemporary) {
       _rewriteTable(pager, table);
@@ -3785,7 +4530,7 @@ class PureDatabase {
       final values = List<Object?>.from(row.values);
       if (values.length >= 5 && values[0] == 'table') {
         final table = tables[_key(values[1].toString())];
-        if (table != null) {
+        if (table != null && table.virtualTable == null) {
           final rootPage = pager.allocatePage();
           table.rootPage = rootPage;
           pager.writePage(
@@ -4023,6 +4768,18 @@ class PureDatabase {
     }
     if (name == 'automatic_index') {
       _automaticIndex = _truthy(value);
+      return 0;
+    }
+    if (name == 'count_changes') {
+      _countChanges = _truthy(value);
+      return 0;
+    }
+    if (name == 'full_column_names') {
+      _fullColumnNames = _truthy(value);
+      return 0;
+    }
+    if (name == 'short_column_names') {
+      _shortColumnNames = _truthy(value);
       return 0;
     }
     if (name == 'temp_store') {
@@ -4293,6 +5050,9 @@ class PureDatabase {
     }
     if (name == 'analysis_limit') return _analysisLimit;
     if (name == 'automatic_index') return _automaticIndex ? 1 : 0;
+    if (name == 'count_changes') return _countChanges ? 1 : 0;
+    if (name == 'full_column_names') return _fullColumnNames ? 1 : 0;
+    if (name == 'short_column_names') return _shortColumnNames ? 1 : 0;
     if (name == 'temp_store') return _tempStore;
     if (name == 'wal_autocheckpoint') {
       return _pager?.walAutoCheckpointPages ?? _walAutoCheckpoint;
@@ -4357,11 +5117,11 @@ class PureDatabase {
       ];
     }
     if (name == 'module_list') {
-      return const [
-        {'name': 'json_each'},
-        {'name': 'json_tree'},
-        {'name': 'jsonb_each'},
-        {'name': 'jsonb_tree'},
+      const builtins = ['json_each', 'json_tree', 'jsonb_each', 'jsonb_tree'];
+      return [
+        for (final module in builtins) {'name': module},
+        for (final module in _virtualTableModules.keys)
+          if (!builtins.contains(module)) {'name': module},
       ];
     }
     if (name == 'compile_options') return const [];
@@ -4517,7 +5277,7 @@ class PureDatabase {
             {
               'schema': 'temp',
               'name': table.name,
-              'type': 'table',
+              'type': table.virtualTable == null ? 'table' : 'virtual',
               'ncol': table.columns.length,
               'wr': 0,
               'strict': 0,
@@ -4538,7 +5298,7 @@ class PureDatabase {
             {
               'schema': 'main',
               'name': table.name,
-              'type': 'table',
+              'type': table.virtualTable == null ? 'table' : 'virtual',
               'ncol': table.columns.length,
               'wr': 0,
               'strict': 0,
@@ -4562,7 +5322,7 @@ class PureDatabase {
                   {
                     'schema': attached.name,
                     'name': table.name,
-                    'type': 'table',
+                    'type': table.virtualTable == null ? 'table' : 'virtual',
                     'ncol': table.columns.length,
                     'wr': 0,
                     'strict': 0,
@@ -4998,6 +5758,9 @@ class PureDatabase {
     if (table == null) {
       throw PureSqlException('no such table: ${statement.table}');
     }
+    if (table.virtualTable != null) {
+      throw PureSqlException('virtual tables cannot have indexes');
+    }
     final index = _Index(
       statement.name,
       table,
@@ -5116,7 +5879,7 @@ class PureDatabase {
         throw PureSqlException('no such table: ${statement.name}');
       }
       if (table.isTemporary) {
-        if (_foreignKeys) {
+        if (_foreignKeys && table.virtualTable == null) {
           final before = _snapshotRows();
           final changedTables = <_Table>{};
           try {
@@ -5145,6 +5908,7 @@ class PureDatabase {
               _key(trigger.table) == _key(table.name),
         );
         _temporaryTables.remove(_key(table.name));
+        _dropVirtualTable(table);
         return 0;
       }
       if (table.isSequenceTable &&
@@ -5153,7 +5917,7 @@ class PureDatabase {
           'cannot drop sqlite_sequence while AUTOINCREMENT tables exist',
         );
       }
-      if (_foreignKeys) {
+      if (_foreignKeys && table.virtualTable == null) {
         final before = _snapshotRows();
         final changedTables = <_Table>{};
         try {
@@ -5193,7 +5957,9 @@ class PureDatabase {
             SqliteIndexBtree.freeTree(pager, index.rootPage!);
           }
         }
-        SqliteTableBtree.freeTree(pager, table.rootPage!);
+        if (table.virtualTable == null) {
+          SqliteTableBtree.freeTree(pager, table.rootPage!);
+        }
         _rewriteSchemaWithout(pager, schemaNames);
       }
       if (table.autoIncrement) {
@@ -5213,6 +5979,7 @@ class PureDatabase {
         _indexes.remove(_key(index.name));
       }
       _tables.remove(_key(table.name));
+      _dropVirtualTable(table);
       return 0;
     }
     final key = _key(statement.name);
@@ -5438,8 +6205,8 @@ class PureDatabase {
           ? null
           : _eval(column.defaultExpression!, const {}, parameters);
     }
+    Object? explicitRowId;
     for (var i = 0; i < columns.length; i++) {
-      final column = table.column(columns[i]);
       final value = _evalQueryExpression(
         values[i],
         _triggerEvalRow(row),
@@ -5448,18 +6215,44 @@ class PureDatabase {
       if (value is _SqlRowValue) {
         throw PureSqlException('row value misused');
       }
+      if (table.isRowIdAlias(columns[i])) {
+        final rowIdColumn = table.rowIdColumn;
+        if (rowIdColumn == null) {
+          explicitRowId = value;
+        } else {
+          row[rowIdColumn.name] = value;
+        }
+        continue;
+      }
+      final column = table.column(columns[i]);
       row[column.name] = value;
     }
     final rowIdColumn = table.rowIdColumn;
-    final requestedRowId = rowIdColumn == null ? null : row[rowIdColumn.name];
+    final requestedRowId = rowIdColumn == null
+        ? explicitRowId
+        : row[rowIdColumn.name] ?? explicitRowId;
     final rowId = requestedRowId == null
         ? table.autoIncrement
               ? _nextAutoIncrementRowId(table)
               : table.nextRowId
         : _asInt(requestedRowId);
-    if (rowId < 1) throw PureSqlException('rowid must be positive');
+    if (table.virtualTable != null) {
+      if (rowId < -0x8000000000000000 || rowId > 0x7fffffffffffffff) {
+        throw PureSqlException(
+          'virtual-table rowid must be a signed 64-bit integer',
+        );
+      }
+    } else if (rowId < 1) {
+      throw PureSqlException('rowid must be positive');
+    }
     if (rowIdColumn != null) row[rowIdColumn.name] = rowId;
-    _fireTriggers(table, 'INSERT', timing: 'BEFORE', newRow: row);
+    _fireTriggers(
+      table,
+      'INSERT',
+      timing: 'BEFORE',
+      newRow: row,
+      newRowId: rowId,
+    );
     final conflicts = _conflictingRows(table, row, rowId);
     for (final upsert in statement.upserts) {
       final result = _applyUpsertClause(
@@ -5498,22 +6291,36 @@ class PureDatabase {
         } else {
           final oldRow = Map<String, Object?>.from(table.rows[index]);
           if (_recursiveTriggers) {
-            _fireTriggers(table, 'DELETE', timing: 'BEFORE', oldRow: oldRow);
+            _fireTriggers(
+              table,
+              'DELETE',
+              timing: 'BEFORE',
+              oldRow: oldRow,
+              oldRowId: rowId,
+            );
           }
           table.rows.removeAt(index);
           table.rowIds.removeAt(index);
           if (_recursiveTriggers) {
-            _fireTriggers(table, 'DELETE', oldRow: oldRow);
+            _fireTriggers(table, 'DELETE', oldRow: oldRow, oldRowId: rowId);
           }
         }
       }
       _validate(table, row);
-      returningRow = _returningRow(table, row, statement.returning, parameters);
+      returningRow = _returningRow(
+        table,
+        row,
+        statement.returning,
+        parameters,
+        rowId: rowId,
+      );
       table.nextRowId = rowId >= table.nextRowId ? rowId + 1 : table.nextRowId;
       table.rows.add(row);
       table.rowIds.add(rowId);
       sequenceChanged = _recordSequence(table, rowId);
-      if (changedTables.isNotEmpty) changedTables.add(table);
+      if (changedTables.isNotEmpty || table.virtualTable != null) {
+        changedTables.add(table);
+      }
       for (final index in table.indexes) {
         _validateIndexRows(index, table.rows);
       }
@@ -5523,7 +6330,9 @@ class PureDatabase {
       rethrow;
     }
     final pager = _pager;
-    if (pager != null && !table.isTemporary) {
+    if (table.virtualTable != null) {
+      _rewriteChangedTables({table});
+    } else if (pager != null && !table.isTemporary) {
       try {
         if (changedTables.isNotEmpty) {
           _rewriteChangedTables(changedTables);
@@ -5549,12 +6358,16 @@ class PureDatabase {
     }
     if (returningRow != null) _lastReturningRows.add(returningRow);
     _lastInsertRowId = rowId;
-    _fireTriggers(table, 'INSERT', newRow: row);
+    _fireTriggers(table, 'INSERT', newRow: row, newRowId: rowId);
     return 1;
   }
 
   SqlRow _triggerEvalRow(SqlRow row) =>
       _activeTriggerContext == null ? row : {...row, ..._activeTriggerContext!};
+
+  SqlRow _tableDmlRow(_Table table, int index) => _triggerEvalRow(
+    _qualifiedRow(table, table.rows[index], null, rowId: table.rowIds[index]),
+  );
 
   void _fireTriggers(
     _Table table,
@@ -5562,6 +6375,8 @@ class PureDatabase {
     String timing = 'AFTER',
     SqlRow? oldRow,
     SqlRow? newRow,
+    int? oldRowId,
+    int? newRowId,
     Set<String> updatedColumns = const {},
   }) {
     for (final trigger in _allTriggers.toList()) {
@@ -5589,6 +6404,11 @@ class PureDatabase {
       for (final column in table.columns) {
         context['@OLD.${column.name}'] = oldRow?[column.name];
         context['@NEW.${column.name}'] = newRow?[column.name];
+      }
+      for (final alias in const ['rowid', '_rowid_', 'oid']) {
+        if (!table.isRowIdAlias(alias)) continue;
+        context['@OLD.$alias'] = oldRowId;
+        context['@NEW.$alias'] = newRowId;
       }
       _activeTriggerContext = context;
       final previousLastInsertRowId = _lastInsertRowId;
@@ -5807,7 +6627,12 @@ class PureDatabase {
     if (clause.doNothing) return 0;
 
     final existing = table.rows[conflictIndex];
-    final context = _qualifiedRow(table, existing, null);
+    final context = _qualifiedRow(
+      table,
+      existing,
+      null,
+      rowId: table.rowIds[conflictIndex],
+    );
     for (final column in table.columns) {
       context['@excluded.${column.name}'] = row[column.name];
     }
@@ -5815,15 +6640,28 @@ class PureDatabase {
       return 0;
     }
     final next = Map<String, Object?>.from(existing);
+    var replacementRowId = table.rowIds[conflictIndex];
     for (final assignment in clause.assignments) {
-      _assignValues(
+      final assignedRowId = _assignValues(
         table,
         next,
         assignment.columns,
         _evalQueryExpression(assignment.expression, context, parameters),
       );
+      if (assignedRowId case _RowIdAssignment(:final value)) {
+        replacementRowId = value == null ? table.nextRowId : _asInt(value);
+      }
     }
-    final returningRow = _returningRow(table, next, returning, parameters);
+    if (table.rowIdColumn case final rowIdColumn?) {
+      replacementRowId = _asInt(next[rowIdColumn.name]);
+    }
+    final returningRow = _returningRow(
+      table,
+      next,
+      returning,
+      parameters,
+      rowId: replacementRowId,
+    );
     final before = _snapshotRows();
     final changedTables = <_Table>{};
     try {
@@ -5837,6 +6675,7 @@ class PureDatabase {
           for (final assignment in clause.assignments)
             for (final name in assignment.columns) _key(name),
         },
+        replacementRowId: table.rowIdColumn == null ? replacementRowId : null,
       );
       for (final changed in changedTables) {
         for (final changedRow in changed.rows) {
@@ -5859,10 +6698,16 @@ class PureDatabase {
     _Table table,
     SqlRow row,
     List<_SelectItem>? items,
-    List<Object?> parameters,
-  ) => items == null
+    List<Object?> parameters, {
+    int? rowId,
+  }) => items == null
       ? null
-      : _project(_qualifiedRow(table, row, null), items, parameters);
+      : _project(
+          _qualifiedRow(table, row, null, rowId: rowId),
+          items,
+          parameters,
+          [(table, null)],
+        );
 
   bool _sameIndexKey(_Index index, SqlRow left, SqlRow right) {
     if (index.where != null &&
@@ -5894,7 +6739,7 @@ class PureDatabase {
   String _indexTermCollation(_Table table, _IndexTerm term) =>
       term.collation ?? _expressionCollation(table, term.expression);
 
-  void _loadFile() {
+  void _loadFile([Map<String, _Table> previousTables = const {}]) {
     final pager = _pager!;
     final schemaRows = SqliteTableBtree.readTree(pager, 1, pageStart: 100);
     for (final schemaRow in schemaRows) {
@@ -5917,6 +6762,56 @@ class PureDatabase {
       final rootPage = schemaRow.values[3];
       if (sql is! String || rootPage is! int) continue;
       final statement = _Parser(sql).parse();
+      if (statement is _CreateVirtualTable) {
+        if (rootPage != 0) {
+          throw SqliteFormatException('invalid virtual-table root page');
+        }
+        final moduleFactory = _virtualTableModules[_key(statement.module)];
+        if (moduleFactory == null) {
+          throw PureSqlException('no such module: ${statement.module}');
+        }
+        final previous = previousTables[_key(statement.name)];
+        final module = previous?.schemaSql == sql
+            ? previous?.virtualTable
+            : null;
+        final instance =
+            module ??
+            moduleFactory(
+              this,
+              'main',
+              statement.name,
+              statement.arguments,
+              create: false,
+            );
+        try {
+          final columns = List<String>.from(instance.columns);
+          final names = <String>{};
+          if (columns.isEmpty) {
+            throw PureSqlException(
+              'virtual tables must expose at least one column',
+            );
+          }
+          for (final column in columns) {
+            if (column.isEmpty || !names.add(_key(column))) {
+              throw PureSqlException('invalid virtual-table column: $column');
+            }
+          }
+          final table = _Table(
+            statement.name,
+            [for (final column in columns) _ColumnDef(column)],
+            rootPage: 0,
+            virtualTable: instance,
+            schemaSql: sql,
+          );
+          _refreshVirtualTableRows(table);
+          _tables[_key(table.name)] = table;
+        } catch (_) {
+          if (!identical(instance, previous?.virtualTable))
+            _disposeVirtualTable(instance);
+          rethrow;
+        }
+        continue;
+      }
       if (statement is! _CreateTable) continue;
       final table = _Table(
         statement.name,
@@ -6049,6 +6944,13 @@ class PureDatabase {
   /// Rolls back any active transaction and releases the database resources.
   void close() {
     if (_inTransaction) _rollback();
+    final modules = {
+      for (final table in [..._tables.values, ..._temporaryTables.values])
+        if (table.virtualTable case final module?) module,
+    };
+    for (final module in modules) {
+      _disposeVirtualTable(module);
+    }
     for (final attached in _attachedDatabases.values) {
       attached.database.close();
     }
@@ -6066,11 +6968,7 @@ class PureDatabase {
     };
     final rowIds = [
       for (var index = 0; index < table.rows.length; index++)
-        if (_matches(
-          statement.where,
-          _triggerEvalRow(table.rows[index]),
-          parameters,
-        ))
+        if (_matches(statement.where, _tableDmlRow(table, index), parameters))
           table.rowIds[index],
     ];
     if (rowIds.isEmpty) return 0;
@@ -6084,28 +6982,33 @@ class PureDatabase {
         if (rowIndex < 0) continue;
         final row = table.rows[rowIndex];
         final next = Map<String, Object?>.from(row);
+        var replacementRowId = rowId;
         for (final assignment in statement.assignments) {
-          _assignValues(
+          final assignedRowId = _assignValues(
             table,
             next,
             assignment.columns,
             _evalQueryExpression(
               assignment.expression,
-              _triggerEvalRow(row),
+              _tableDmlRow(table, rowIndex),
               parameters,
             ),
           );
+          if (assignedRowId case _RowIdAssignment(:final value)) {
+            replacementRowId = value == null ? table.nextRowId : _asInt(value);
+          }
+        }
+        final rowIdColumn = table.rowIdColumn;
+        if (rowIdColumn != null) {
+          replacementRowId = _asInt(next[rowIdColumn.name]);
         }
         final returningRow = _returningRow(
           table,
           next,
           statement.returning,
           parameters,
+          rowId: replacementRowId,
         );
-        final rowIdColumn = table.rowIdColumn;
-        final replacementRowId = rowIdColumn == null
-            ? rowId
-            : _asInt(next[rowIdColumn.name]);
         final conflicts = [
           for (final index in _conflictingRows(table, next, replacementRowId))
             if (table.rowIds[index] != rowId) table.rowIds[index],
@@ -6133,13 +7036,19 @@ class PureDatabase {
                   'DELETE',
                   timing: 'BEFORE',
                   oldRow: oldConflictRow,
+                  oldRowId: conflictRowId,
                 );
               }
               table.rows.removeAt(conflictIndex);
               table.rowIds.removeAt(conflictIndex);
               changedTables.add(table);
               if (_recursiveTriggers) {
-                _fireTriggers(table, 'DELETE', oldRow: oldConflictRow);
+                _fireTriggers(
+                  table,
+                  'DELETE',
+                  oldRow: oldConflictRow,
+                  oldRowId: conflictRowId,
+                );
               }
             }
           }
@@ -6157,6 +7066,7 @@ class PureDatabase {
             changedTables,
             {},
             updatedColumns: updatedColumns,
+            replacementRowId: rowIdColumn == null ? replacementRowId : null,
           );
           for (final changed in changedTables) {
             for (final index in changed.indexes) {
@@ -6315,7 +7225,7 @@ class PureDatabase {
         message.startsWith('CHECK constraint failed: ${table.name}.');
   }
 
-  void _assignValues(
+  _RowIdAssignment? _assignValues(
     _Table table,
     SqlRow row,
     List<String> columns,
@@ -6330,9 +7240,20 @@ class PureDatabase {
         'assignment column count does not match value count',
       );
     }
+    _RowIdAssignment? rowIdAssignment;
     for (var index = 0; index < columns.length; index++) {
-      row[table.column(columns[index]).name] = values[index];
+      if (table.isRowIdAlias(columns[index])) {
+        final rowIdColumn = table.rowIdColumn;
+        if (rowIdColumn == null) {
+          rowIdAssignment = _RowIdAssignment(values[index]);
+        } else {
+          row[rowIdColumn.name] = values[index];
+        }
+      } else {
+        row[table.column(columns[index]).name] = values[index];
+      }
     }
+    return rowIdAssignment;
   }
 
   int _delete(_Delete statement, List<Object?> parameters) {
@@ -6341,11 +7262,7 @@ class PureDatabase {
     final table = _table(statement.table);
     final rowIds = [
       for (var index = table.rows.length - 1; index >= 0; index--)
-        if (_matches(
-          statement.where,
-          _triggerEvalRow(table.rows[index]),
-          parameters,
-        ))
+        if (_matches(statement.where, _tableDmlRow(table, index), parameters))
           table.rowIds[index],
     ];
     if (rowIds.isEmpty) return 0;
@@ -6363,16 +7280,23 @@ class PureDatabase {
           oldRow,
           statement.returning,
           parameters,
+          rowId: rowId,
         );
         try {
           if (_foreignKeys) {
             _deleteRowWithActions(table, rowId, changedTables, {});
           } else {
-            _fireTriggers(table, 'DELETE', timing: 'BEFORE', oldRow: oldRow);
+            _fireTriggers(
+              table,
+              'DELETE',
+              timing: 'BEFORE',
+              oldRow: oldRow,
+              oldRowId: rowId,
+            );
             table.rows.removeAt(rowIndex);
             table.rowIds.removeAt(rowIndex);
             changedTables.add(table);
-            _fireTriggers(table, 'DELETE', oldRow: oldRow);
+            _fireTriggers(table, 'DELETE', oldRow: oldRow, oldRowId: rowId);
           }
         } on _TriggerRaiseException catch (raise, stackTrace) {
           if (_triggerExecutionDepth > 0) rethrow;
@@ -6490,13 +7414,25 @@ class PureDatabase {
       entry.key.recordOffsets
         ..clear()
         ..addAll(entry.value.$4);
+      _restoreVirtualTableState(entry.key, entry.key.rows, entry.key.rowIds);
     }
   }
 
   void _rewriteChangedTables(Set<_Table> tables) {
     final pager = _pager;
-    if (pager == null) return;
     for (final table in tables) {
+      if (table.virtualTable case final module?) {
+        module.replaceRows([
+          for (var index = 0; index < table.rows.length; index++)
+            SqlVirtualTableRow(
+              table.rowIds[index],
+              Map<String, Object?>.from(table.rows[index]),
+            ),
+        ]);
+        _dirtyVirtualTables.add(module);
+        continue;
+      }
+      if (pager == null) continue;
       if (table.isTemporary) continue;
       _rewriteTable(pager, table);
       _rewriteIndexes(pager, table);
@@ -6705,7 +7641,13 @@ class PureDatabase {
       if (parentIndex < 0) return;
       final parentRow = Map<String, Object?>.from(parent.rows[parentIndex]);
       if (fireParentTrigger) {
-        _fireTriggers(parent, 'DELETE', timing: 'BEFORE', oldRow: parentRow);
+        _fireTriggers(
+          parent,
+          'DELETE',
+          timing: 'BEFORE',
+          oldRow: parentRow,
+          oldRowId: parentRowId,
+        );
       }
       parent.rows.removeAt(parentIndex);
       parent.rowIds.removeAt(parentIndex);
@@ -6752,7 +7694,12 @@ class PureDatabase {
         }
       }
       if (fireParentTrigger) {
-        _fireTriggers(parent, 'DELETE', oldRow: parentRow);
+        _fireTriggers(
+          parent,
+          'DELETE',
+          oldRow: parentRow,
+          oldRowId: parentRowId,
+        );
       }
     } finally {
       visiting.remove(identity);
@@ -6766,6 +7713,7 @@ class PureDatabase {
     Set<_Table> changedTables,
     Set<(_Table, int)> visiting, {
     Set<String>? updatedColumns,
+    int? replacementRowId,
     bool fireParentTrigger = true,
   }) {
     final identity = (parent, parentRowId);
@@ -6774,6 +7722,10 @@ class PureDatabase {
       final parentIndex = parent.rowIds.indexOf(parentRowId);
       if (parentIndex < 0) return;
       final oldParentRow = Map<String, Object?>.from(parent.rows[parentIndex]);
+      final rowIdColumn = parent.rowIdColumn;
+      final nextParentRowId = rowIdColumn != null
+          ? _asInt(nextParentRow[rowIdColumn.name])
+          : replacementRowId ?? parentRowId;
       final columns =
           updatedColumns ??
           {
@@ -6822,6 +7774,8 @@ class PureDatabase {
           timing: 'BEFORE',
           oldRow: oldParentRow,
           newRow: nextParentRow,
+          oldRowId: parentRowId,
+          newRowId: nextParentRowId,
           updatedColumns: columns,
         );
       }
@@ -6876,10 +7830,15 @@ class PureDatabase {
       final index = parent.rows.indexOf(current);
       if (index >= 0) {
         _validate(parent, current, ignore: current);
-        final rowIdColumn = parent.rowIdColumn;
-        if (rowIdColumn != null) {
-          final nextRowId = _asInt(current[rowIdColumn.name]);
-          if (nextRowId < 1 ||
+        final nextRowId = rowIdColumn != null
+            ? _asInt(current[rowIdColumn.name])
+            : replacementRowId;
+        if (nextRowId != null) {
+          final invalidRowId = parent.virtualTable != null
+              ? nextRowId < -0x8000000000000000 ||
+                    nextRowId > 0x7fffffffffffffff
+              : nextRowId < 1;
+          if (invalidRowId ||
               parent.rowIds.asMap().entries.any(
                 (entry) => entry.key != index && entry.value == nextRowId,
               )) {
@@ -6897,6 +7856,8 @@ class PureDatabase {
           'UPDATE',
           oldRow: oldParentRow,
           newRow: nextParentRow,
+          oldRowId: parentRowId,
+          newRowId: nextParentRowId,
           updatedColumns: columns,
         );
       }
@@ -7312,6 +8273,7 @@ class PureDatabase {
             group,
             statement.items,
             parameters,
+            sources: sourceTables,
             selectSubquery: _runSubquery,
           ),
       ];
@@ -7413,7 +8375,8 @@ class PureDatabase {
     }
 
     final result = [
-      for (final row in rows) _project(row, statement.items, parameters),
+      for (final row in rows)
+        _project(row, statement.items, parameters, sourceTables),
     ];
     return statement.distinct ? _distinctRows(result) : result;
   }
@@ -7743,11 +8706,11 @@ class PureDatabase {
       return queryContext._selectTable(name, ctes, parameters);
     }
     final temporary = _temporaryTables[key];
-    if (temporary != null) return temporary;
+    if (temporary != null) return _currentTable(temporary);
     final view = _temporaryViews[key] ?? _views[key];
     if (view == null) {
       final mainTable = _tables[key];
-      if (mainTable != null) return mainTable;
+      if (mainTable != null) return _currentTable(mainTable);
       for (final attached in _attachedDatabases.values) {
         final table = identical(attached.database, _activeAttachedWriteDatabase)
             ? attached.database._tryResolveMainSchemaTable(name, parameters)
@@ -7760,7 +8723,7 @@ class PureDatabase {
         if (table != null) {
           if (_inTransaction)
             _transactionAttachedDatabases.add(attached.database);
-          return table;
+          return _currentTable(table);
         }
       }
       throw PureSqlException('no such table: $name');
@@ -7800,7 +8763,7 @@ class PureDatabase {
         return override._selectSchemaTable('temp', name, parameters);
       }
       final table = _temporaryTables[_key(name)];
-      if (table != null) return table;
+      if (table != null) return _currentTable(table);
       final view = _temporaryViews[_key(name)];
       if (view == null) throw PureSqlException('no such table: $schema.$name');
       return _materializeSchemaView(view, parameters);
@@ -7827,7 +8790,7 @@ class PureDatabase {
 
   _Table? _tryResolveMainSchemaTable(String name, List<Object?> parameters) {
     final table = _tables[_key(name)];
-    if (table != null) return table;
+    if (table != null) return _currentTable(table);
     final view = _views[_key(name)];
     if (view == null) return null;
     return _materializeSchemaView(view, parameters);
@@ -7869,7 +8832,16 @@ class PureDatabase {
     if (resultNames.length != names.length) {
       throw PureSqlException('CTE column count does not match its query');
     }
-    return _Table(name, [for (final column in names) _ColumnDef(column)])
+    final definitions = _queryColumnDefinitions(query.query, parameters);
+    return _Table(name, [
+        for (var index = 0; index < names.length; index++)
+          _ColumnDef(
+            names[index],
+            typeName: definitions.length == names.length
+                ? definitions[index].typeName
+                : null,
+          ),
+      ])
       ..rows.addAll([
         for (final row in rows)
           {
@@ -8141,16 +9113,61 @@ class PureDatabase {
     return _evalQueryExpression(expression, source, parameters);
   }
 
+  String _resultColumnName(_SelectItem item, List<(_Table, String?)> sources) {
+    final expression = item.expression;
+    if (item.explicitAlias ||
+        expression is! _Column ||
+        expression.name == '*' ||
+        expression.name.endsWith('.*')) {
+      return item.outputName;
+    }
+    final unqualifiedColumn = sources.any(
+      (entry) =>
+          entry.$1.columns.any(
+            (column) => _key(column.name) == _key(expression.name),
+          ) ||
+          entry.$1.isRowIdAlias(expression.name),
+    );
+    final separator = unqualifiedColumn ? -1 : expression.name.lastIndexOf('.');
+    final columnName = separator < 0
+        ? expression.name
+        : expression.name.substring(separator + 1);
+    if (separator >= 0) {
+      if (!_fullColumnNames && _shortColumnNames) return columnName;
+      final qualifier = expression.name.substring(0, separator);
+      final source = sources.where(
+        (entry) =>
+            _key(entry.$1.name) == _key(qualifier) ||
+            _key(entry.$2 ?? '') == _key(qualifier),
+      );
+      return source.isEmpty
+          ? item.outputName
+          : '${source.first.$1.name}.$columnName';
+    }
+    if (_fullColumnNames) {
+      for (final (table, _) in sources) {
+        if (table.columns.any(
+              (column) => _key(column.name) == _key(columnName),
+            ) ||
+            table.isRowIdAlias(columnName)) {
+          return '${table.name}.$columnName';
+        }
+      }
+    }
+    return item.outputName;
+  }
+
   SqlRow _projectGroup(
     List<SqlRow> group,
     List<_SelectItem> items,
     List<Object?> parameters, {
+    List<(_Table, String?)> sources = const [],
     List<SqlRow> Function(_Select, SqlRow, List<Object?>)? selectSubquery,
   }) {
     final row = group.isEmpty ? <String, Object?>{} : group.first;
     return <String, Object?>{
       for (final item in items)
-        item.outputName: item.expression is _ScalarSubquery
+        _resultColumnName(item, sources): item.expression is _ScalarSubquery
             ? _selectScalar(item.expression as _ScalarSubquery, row, parameters)
             : _evalGroup(
                 item.expression,
@@ -8263,8 +9280,9 @@ class PureDatabase {
   SqlRow _project(
     SqlRow row,
     List<_SelectItem> items,
-    List<Object?> parameters,
-  ) {
+    List<Object?> parameters, [
+    List<(_Table, String?)> sources = const [],
+  ]) {
     final result = <String, Object?>{};
     for (final item in items) {
       final expression = item.expression;
@@ -8287,7 +9305,7 @@ class PureDatabase {
         if (value is _SqlRowValue) {
           throw PureSqlException('row value misused');
         }
-        result[item.outputName] = value;
+        result[_resultColumnName(item, sources)] = value;
       }
     }
     return result;
@@ -8306,7 +9324,7 @@ class PureDatabase {
         'temp' => _temporaryTables[key],
         _ => null,
       };
-      if (table != null) return table;
+      if (table != null) return _currentTable(table);
       throw PureSqlException('no such table: $schema.$name');
     }
     final separator = name.indexOf('\u0000');
@@ -8320,7 +9338,7 @@ class PureDatabase {
           );
         }
         final mainTable = _tables[_key(table)];
-        if (mainTable != null) return mainTable;
+        if (mainTable != null) return _currentTable(mainTable);
       } else if (_key(schema) == 'temp') {
         if (_schemaTempOverride != null) {
           throw PureSqlException(
@@ -8328,7 +9346,7 @@ class PureDatabase {
           );
         }
         final temporaryTable = _temporaryTables[_key(table)];
-        if (temporaryTable != null) return temporaryTable;
+        if (temporaryTable != null) return _currentTable(temporaryTable);
       } else if (_attachedDatabases.containsKey(_key(schema))) {
         throw PureSqlException(
           'writes to attached databases are not supported: $schema.$table',
@@ -8338,7 +9356,7 @@ class PureDatabase {
     }
     final key = _key(name);
     final table = _temporaryTables[key] ?? _tables[key];
-    if (table != null) return table;
+    if (table != null) return _currentTable(table);
     for (final attached in _attachedDatabases.values) {
       final exists = attached.database._withCurrentFile(
         () =>
@@ -8430,7 +9448,7 @@ class Database {
     updatedRows = _database.execute(sql, parameters);
   }
 
-  /// Runs a `SELECT` or read-only `PRAGMA` and returns its rows.
+  /// Runs a `SELECT`, read-only `PRAGMA`, or DML row-producing statement.
   ResultSet select(String sql, [Object? parameters = const []]) => [
     for (final row in _database.select(sql, parameters))
       {
@@ -8708,6 +9726,7 @@ bool _triggerReferencesTable(String sql, String tableName) =>
   }
 
   final bodyColumnReferences = <int>{};
+  final bodyAnalyzedQueryTokens = <int>{};
   final bodyTableTokens = <int>{};
   bool targetsAlteredTable(_Statement step) => switch (step) {
     _Insert(:final table) || _Update(:final table) || _Delete(:final table) =>
@@ -8726,7 +9745,8 @@ bool _triggerReferencesTable(String sql, String tableName) =>
         (join) =>
             join.table != null &&
             _key(join.table!.replaceAll('\u0000', '.')) == _key(alteredTable),
-      );
+      ) ||
+      query.compoundTerms.any((term) => directlyReadsAlteredTable(term.query));
   bool addQueryColumnReferences(
     _Select query,
     int selectTokenIndex,
@@ -8735,6 +9755,17 @@ bool _triggerReferencesTable(String sql, String tableName) =>
   }) {
     final startOffset = tokens[selectTokenIndex].start;
     final endOffset = tokens[end - 1].end;
+    void markAnalyzed(int localStart, int localEnd) {
+      final absoluteStart = startOffset + localStart;
+      final absoluteEnd = startOffset + localEnd;
+      for (var index = selectTokenIndex; index < end; index++) {
+        if (tokens[index].start >= absoluteStart &&
+            tokens[index].end <= absoluteEnd) {
+          bodyAnalyzedQueryTokens.add(index);
+        }
+      }
+    }
+
     final codeUnits = sql.substring(startOffset, endOffset).codeUnits.toList();
     for (final range in nested) {
       final from = tokens[range.start].start - startOffset;
@@ -8747,19 +9778,85 @@ bool _triggerReferencesTable(String sql, String tableName) =>
       }
     }
     final querySql = String.fromCharCodes(codeUnits);
-    final result = _viewColumnRenameReferences(
-      query,
-      alteredTable,
-      column,
-      querySql,
-      (_) => true,
-    );
-    if (!result.safe) return false;
-    for (final reference in result.tokens) {
-      final absoluteStart = startOffset + reference.start;
-      final tokenIndex = tokenIndicesByStart[absoluteStart];
-      if (tokenIndex == null) return false;
-      bodyColumnReferences.add(tokenIndex);
+    if (query.compoundTerms.isEmpty) {
+      final result = _viewColumnRenameReferences(
+        query,
+        alteredTable,
+        column,
+        querySql,
+        (_) => true,
+      );
+      if (!result.safe) return false;
+      markAnalyzed(0, endOffset - startOffset);
+      for (final reference in result.tokens) {
+        final absoluteStart = startOffset + reference.start;
+        final tokenIndex = tokenIndicesByStart[absoluteStart];
+        if (tokenIndex == null) return false;
+        bodyColumnReferences.add(tokenIndex);
+      }
+      return true;
+    }
+
+    final queryTokens = _Tokenizer(querySql).tokenize();
+    final separators = <_Token>[];
+    var depth = 0;
+    for (final token in queryTokens) {
+      if (token.text == '(') depth++;
+      if (token.text == ')') depth--;
+      if (depth == 0 &&
+          token.type == _TokenType.word &&
+          !token.quoted &&
+          const {
+            'UNION',
+            'INTERSECT',
+            'EXCEPT',
+          }.contains(token.text.toUpperCase())) {
+        separators.add(token);
+      }
+    }
+    if (separators.length != query.compoundTerms.length) return false;
+    var segmentStart = 0;
+    for (var index = 0; index <= separators.length; index++) {
+      final segmentEnd = index == separators.length
+          ? querySql.length
+          : separators[index].start;
+      final segment = querySql.substring(segmentStart, segmentEnd);
+      final parsed = _Parser(segment).parse();
+      if (parsed is! _Select || parsed.compoundTerms.isNotEmpty) return false;
+      markAnalyzed(segmentStart, segmentEnd);
+      if (directlyReadsAlteredTable(parsed)) {
+        final result = _viewColumnRenameReferences(
+          parsed,
+          alteredTable,
+          column,
+          segment,
+          (_) => true,
+        );
+        if (!result.safe) return false;
+        for (final reference in result.tokens) {
+          final absoluteStart = startOffset + segmentStart + reference.start;
+          final tokenIndex = tokenIndicesByStart[absoluteStart];
+          if (tokenIndex == null) return false;
+          bodyColumnReferences.add(tokenIndex);
+        }
+      }
+      if (index < separators.length) {
+        final separator = separators[index];
+        segmentStart = separator.end;
+        if (segmentStart < querySql.length) {
+          final afterOperator = _Tokenizer(
+            querySql.substring(segmentStart),
+          ).tokenize().first;
+          if (afterOperator.type == _TokenType.word &&
+              !afterOperator.quoted &&
+              const {
+                'ALL',
+                'DISTINCT',
+              }.contains(afterOperator.text.toUpperCase())) {
+            segmentStart += afterOperator.end;
+          }
+        }
+      }
     }
     return true;
   }
@@ -8964,6 +10061,7 @@ bool _triggerReferencesTable(String sql, String tableName) =>
       references.add(token);
       continue;
     }
+    if (bodyAnalyzedQueryTokens.contains(index)) continue;
     final oldOrNewColumn =
         index >= 2 &&
         tokens[index - 1].text == '.' &&
@@ -9981,6 +11079,23 @@ Object? _castSqlValue(Object? value, String type) {
   return int.tryParse(text) ?? double.tryParse(text) ?? value;
 }
 
+String _ctasDeclaredType(String declaredType) {
+  final type = declaredType.toUpperCase();
+  if (type.contains('INT')) return 'INT';
+  if (type.contains('CHAR') || type.contains('CLOB') || type.contains('TEXT')) {
+    return 'TEXT';
+  }
+  if (type.contains('BLOB') || type.isEmpty) return '';
+  if (type.contains('REAL') || type.contains('FLOA') || type.contains('DOUB')) {
+    return 'REAL';
+  }
+  return 'NUM';
+}
+
+String _sourceLeaf(String name) => name.substring(
+  name.lastIndexOf(name.contains('\u0000') ? '\u0000' : '.') + 1,
+);
+
 Object? _evalBetween(
   Object? value,
   Object? lower,
@@ -10909,18 +12024,22 @@ Object? _applyFunction(String name, List<Object?> values) {
                       null,
                 )
                 .toSet();
-      final digits = <int>[];
+      final bytes = <int>[];
+      int? highNibble;
       for (final rune in values.first.toString().runes) {
-        if (ignored.contains(rune)) continue;
         final digit = int.tryParse(String.fromCharCode(rune), radix: 16);
-        if (digit == null) return null;
-        digits.add(digit);
+        if (digit != null) {
+          if (highNibble == null) {
+            highNibble = digit;
+          } else {
+            bytes.add((highNibble << 4) | digit);
+            highNibble = null;
+          }
+        } else if (!ignored.contains(rune) || highNibble != null) {
+          return null;
+        }
       }
-      if (digits.length.isOdd) return null;
-      return [
-        for (var index = 0; index < digits.length; index += 2)
-          (digits[index] << 4) | digits[index + 1],
-      ];
+      return highNibble == null ? bytes : null;
     case 'UNISTR':
       _requireArity(name, values, 1);
       return values.single == null
@@ -13477,20 +14596,6 @@ bool _selectReferencesColumn(_Select query, String name) =>
       (term) => _selectReferencesColumn(term.query, name),
     );
 
-bool _selectHasWildcard(_Select query) =>
-    query.items.any(
-      (item) =>
-          item.expression is _Column &&
-              const ['*'].contains((item.expression as _Column).name) ||
-          item.expression is _Column &&
-              (item.expression as _Column).name.endsWith('.*'),
-    ) ||
-    query.joins.any(
-      (join) => join.query != null && _selectHasWildcard(join.query!),
-    ) ||
-    query.fromQuery != null && _selectHasWildcard(query.fromQuery!) ||
-    query.compoundTerms.any((term) => _selectHasWildcard(term.query));
-
 bool _constantRangeOffset(_Expr expression) => switch (expression) {
   _Literal(:final value) => value is num,
   _Param() => true,
@@ -15027,14 +16132,6 @@ Object? _applyBase85(List<Object?> values) {
   return bytes;
 }
 
-String _columnSql(_ColumnDef column) => [
-  column.name,
-  if (column.typeName != null) column.typeName!,
-  if (column.notNull) 'NOT NULL',
-  if (column.defaultExpression != null)
-    'DEFAULT ${_expressionSql(column.defaultExpression!)}',
-].join(' ');
-
 String _expressionSql(_Expr expression) => switch (expression) {
   _Literal(:final value) =>
     value == null
@@ -15050,6 +16147,7 @@ class _Table {
     this.name,
     this.columns, {
     this.rootPage,
+    this.virtualTable,
     this.schemaSql,
     this.isSequenceTable = false,
     this.isTemporary = false,
@@ -15062,6 +16160,7 @@ class _Table {
   String name;
   final List<_ColumnDef> columns;
   int? rootPage;
+  final SqlVirtualTable? virtualTable;
   final bool isSequenceTable;
   bool isTemporary;
   List<String> primaryKeyColumns;
@@ -15076,6 +16175,12 @@ class _Table {
   int nextRowId = 1;
 
   bool get autoIncrement => columns.any((column) => column.autoIncrement);
+
+  bool isRowIdAlias(String name) {
+    final key = _key(name);
+    return const {'rowid', '_rowid_', 'oid'}.contains(key) &&
+        !columns.any((column) => _key(column.name) == key);
+  }
 
   _ColumnDef? get rowIdColumn {
     for (final column in columns) {
@@ -15102,6 +16207,7 @@ class _Table {
       name,
       [for (final column in columns) column.copy()],
       rootPage: rootPage,
+      virtualTable: virtualTable,
       schemaSql: schemaSql,
       isSequenceTable: isSequenceTable,
       isTemporary: isTemporary,
@@ -15272,6 +16378,22 @@ class _CreateTable extends _Statement {
   }
 }
 
+class _CreateVirtualTable extends _Statement {
+  _CreateVirtualTable(
+    this.name,
+    this.module,
+    this.arguments,
+    this.ifNotExists, {
+    this.temporary = false,
+  });
+
+  final String name;
+  final String module;
+  final List<String> arguments;
+  final bool ifNotExists;
+  final bool temporary;
+}
+
 class _CreateTableAs extends _Statement {
   _CreateTableAs(
     this.name,
@@ -15351,10 +16473,11 @@ class _CreateIndex extends _Statement {
 }
 
 class _AlterTable extends _Statement {
-  _AlterTable(this.table, this.column, {this.schema});
+  _AlterTable(this.table, this.column, this.definitionSql, {this.schema});
 
   final String table;
   final _ColumnDef column;
+  final String definitionSql;
   final String? schema;
 }
 
@@ -15420,6 +16543,8 @@ class _SqlSavepoint {
     required this.userVersion,
     required this.memoryPageSize,
     required this.temporaryPragmaValues,
+    required this.pendingVirtualTableDestroy,
+    required this.dirtyVirtualTables,
   });
 
   final String name;
@@ -15436,6 +16561,8 @@ class _SqlSavepoint {
   final int userVersion;
   final int memoryPageSize;
   final Map<String, Object> temporaryPragmaValues;
+  final List<SqlVirtualTable> pendingVirtualTableDestroy;
+  final Set<SqlVirtualTable> dirtyVirtualTables;
 }
 
 class _Pragma extends _Statement {
@@ -15640,6 +16767,12 @@ class _UpdateAssignment {
   final _Expr expression;
 }
 
+class _RowIdAssignment {
+  const _RowIdAssignment(this.value);
+
+  final Object? value;
+}
+
 class _Delete extends _Statement {
   _Delete(this.table, this.where, {this.returning});
   final String table;
@@ -15648,9 +16781,10 @@ class _Delete extends _Statement {
 }
 
 class _SelectItem {
-  _SelectItem(this.expression, this.outputName);
+  _SelectItem(this.expression, this.outputName, {this.explicitAlias = false});
   final _Expr expression;
   final String outputName;
+  final bool explicitAlias;
 }
 
 class _Function extends _Expr {
@@ -16128,7 +17262,8 @@ class _Tokenizer {
 }
 
 class _Parser {
-  _Parser(String sql) : _tokens = _Tokenizer(sql).tokenize();
+  _Parser(String sql) : _sql = sql, _tokens = _Tokenizer(sql).tokenize();
+  final String _sql;
   final List<_Token> _tokens;
   Map<String, _Cte> _cteContext = const {};
   final Map<String, int> _namedParameters = {};
@@ -16300,6 +17435,21 @@ class _Parser {
       return _createTrigger(temporary: temporary);
     }
     if (_acceptWord('VIEW')) return _createView(temporary: temporary);
+    if (_acceptWord('VIRTUAL')) {
+      _expectWord('TABLE');
+      final ifNotExists =
+          _acceptWord('IF') && _acceptWord('NOT') && _acceptWord('EXISTS');
+      final name = _tableReference();
+      _expectWord('USING');
+      final module = _identifier();
+      return _CreateVirtualTable(
+        name,
+        module,
+        _virtualTableArguments(),
+        ifNotExists,
+        temporary: temporary,
+      );
+    }
     _expectWord('TABLE');
     final ifNotExists =
         _acceptWord('IF') && _acceptWord('NOT') && _acceptWord('EXISTS');
@@ -16470,6 +17620,34 @@ class _Parser {
       foreignKeyConstraints: foreignKeyConstraints,
       temporary: temporary,
     );
+  }
+
+  List<String> _virtualTableArguments() {
+    if (!_accept('(')) return const [];
+    if (_accept(')')) return const [];
+    final arguments = <String>[];
+    var depth = 0;
+    var start = _peek.start;
+    while (_peek.type != _TokenType.eof) {
+      final token = _peek;
+      if (token.text == '(') {
+        depth++;
+      } else if (token.text == ')') {
+        if (depth == 0) {
+          arguments.add(_sql.substring(start, token.start).trim());
+          _advance();
+          return arguments;
+        }
+        depth--;
+      } else if (token.text == ',' && depth == 0) {
+        arguments.add(_sql.substring(start, token.start).trim());
+        _advance();
+        start = _peek.start;
+        continue;
+      }
+      _advance();
+    }
+    throw PureSqlException('unterminated virtual-table arguments');
   }
 
   _CreateTrigger _createTrigger({bool temporary = false}) {
@@ -16788,16 +17966,54 @@ class _Parser {
     }
     _expectWord('ADD');
     _acceptWord('COLUMN');
+    final definitionStart = _peek.start;
     final name = _identifier();
     final typeName = _declaredType();
     var notNull = false;
+    var primaryKey = false;
+    var autoIncrement = false;
+    var unique = false;
     _Expr? defaultExpression;
+    String? referencesTable;
+    String? referencesColumn;
+    var onDelete = 'NO ACTION';
+    var onUpdate = 'NO ACTION';
+    String? collation;
+    final checks = <_Expr>[];
     while (_peek.type == _TokenType.word) {
       if (_acceptWord('NOT')) {
         _expectWord('NULL');
         notNull = true;
       } else if (_acceptWord('DEFAULT')) {
         defaultExpression = _primary();
+      } else if (_acceptWord('PRIMARY')) {
+        _expectWord('KEY');
+        primaryKey = true;
+      } else if (_acceptWord('UNIQUE')) {
+        unique = true;
+      } else if (_acceptWord('AUTOINCREMENT')) {
+        autoIncrement = true;
+      } else if (_acceptWord('CHECK')) {
+        checks.add(_checkExpression());
+      } else if (_acceptWord('REFERENCES')) {
+        referencesTable = _identifier();
+        if (_accept('(')) {
+          referencesColumn = _identifier();
+          _expect(')');
+        }
+      } else if (_acceptWord('ON')) {
+        if (_acceptWord('DELETE')) {
+          onDelete = _foreignKeyAction();
+        } else if (_acceptWord('UPDATE')) {
+          onUpdate = _foreignKeyAction();
+        } else {
+          throw PureSqlException('expected DELETE or UPDATE after ON');
+        }
+      } else if (_acceptWord('COLLATE')) {
+        collation = _identifier().toUpperCase();
+        if (!const ['BINARY', 'NOCASE'].contains(collation)) {
+          throw PureSqlException('unsupported collation: $collation');
+        }
       } else {
         throw PureSqlException('unsupported ALTER TABLE option: ${_peek.text}');
       }
@@ -16808,8 +18024,18 @@ class _Parser {
         name,
         typeName: typeName,
         notNull: notNull,
+        primaryKey: primaryKey,
+        autoIncrement: autoIncrement,
+        unique: unique,
         defaultExpression: defaultExpression,
+        referencesTable: referencesTable,
+        referencesColumn: referencesColumn,
+        onDelete: onDelete,
+        onUpdate: onUpdate,
+        collation: collation,
+        checkExpressions: checks,
       ),
+      _sql.substring(definitionStart, _tokens[_index - 1].end),
     );
   }
 
@@ -17176,12 +18402,13 @@ class _Parser {
     } else {
       do {
         final expression = _expression();
-        final name = _acceptWord('AS')
+        final explicitAlias = _acceptWord('AS');
+        final name = explicitAlias
             ? _identifier()
             : expression is _Column
             ? expression.name
             : 'column${items.length + 1}';
-        items.add(_SelectItem(expression, name));
+        items.add(_SelectItem(expression, name, explicitAlias: explicitAlias));
       } while (_accept(','));
     }
     String? table;
@@ -17479,12 +18706,13 @@ class _Parser {
         items.add(_SelectItem(_Column('*'), '*'));
       } else {
         final expression = _expression();
-        final name = _acceptWord('AS')
+        final explicitAlias = _acceptWord('AS');
+        final name = explicitAlias
             ? _identifier()
             : expression is _Column
             ? expression.name
             : 'column${items.length + 1}';
-        items.add(_SelectItem(expression, name));
+        items.add(_SelectItem(expression, name, explicitAlias: explicitAlias));
       }
     } while (_accept(','));
     return items;

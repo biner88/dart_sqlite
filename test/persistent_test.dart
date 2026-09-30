@@ -1454,6 +1454,13 @@ Future<void> main(List<String> args) async {
     CREATE TABLE ctas_copy AS
     SELECT id, label AS copied_label FROM ctas_source
   ''');
+  assert(
+    database
+            .select('PRAGMA table_info(ctas_copy)')
+            .map((row) => row['type'])
+            .join(',') ==
+        'INT,TEXT',
+  );
   database.execute('CREATE TABLE session_shadow_rows (value TEXT)');
   database.execute("INSERT INTO session_shadow_rows VALUES ('main')");
   final schemaVersionBeforeTemp = database
@@ -1673,6 +1680,14 @@ Future<void> main(List<String> args) async {
   database.execute(
     "INSERT INTO persistent_drop_column VALUES (1, 'gone', 'kept')",
   );
+  database.execute('''
+    CREATE VIEW persistent_drop_column_projection AS
+    SELECT remove_me FROM persistent_drop_column
+  ''');
+  database.execute('''
+    CREATE VIEW persistent_drop_column_wildcard AS
+    SELECT * FROM persistent_drop_column
+  ''');
   database.execute('ALTER TABLE persistent_drop_column DROP COLUMN remove_me');
   database.execute(
     'CREATE TABLE persistent_drop_parent (id INTEGER PRIMARY KEY)',
@@ -1833,6 +1848,14 @@ Future<void> main(List<String> args) async {
         'new',
   );
   database.execute('''
+    ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'
+    CHECK (status IN ('active', 'disabled'))
+  ''');
+  assert(
+    database.select('SELECT status FROM users WHERE id = 1').single['status'] ==
+        'active',
+  );
+  database.execute('''
     CREATE VIEW first_users(user_id, display_name) AS
       SELECT id, name FROM users WHERE id < 3
   ''');
@@ -1958,7 +1981,36 @@ Future<void> main(List<String> args) async {
   database.close();
 
   final reopened = PureDatabase.open(path);
+  assert(
+    reopened
+            .select('PRAGMA table_info(ctas_copy)')
+            .map((row) => row['type'])
+            .join(',') ==
+        'INT,TEXT',
+  );
   assert(reopened.select('PRAGMA query_only').single['query_only'] == 0);
+  assert(
+    reopened.select('SELECT status FROM users WHERE id = 1').single['status'] ==
+        'active',
+  );
+  try {
+    reopened.execute("UPDATE users SET status = 'invalid' WHERE id = 1");
+    assert(false, 'persistent ADD COLUMN CHECK remains enforced');
+  } on PureSqlException {
+    // The added column constraint survived reopen.
+  }
+  final reopenedDropWildcard = reopened
+      .select('SELECT * FROM persistent_drop_column_wildcard')
+      .single;
+  assert(reopenedDropWildcard.length == 2);
+  assert(reopenedDropWildcard['keep'] == 'kept');
+  var reopenedDropProjectionInvalid = false;
+  try {
+    reopened.select('SELECT * FROM persistent_drop_column_projection');
+  } on PureSqlException catch (error) {
+    reopenedDropProjectionInvalid = error.message.contains('no such column');
+  }
+  assert(reopenedDropProjectionInvalid);
   assert(
     reopened.select('SELECT value FROM session_shadow_rows').single['value'] ==
         'main',

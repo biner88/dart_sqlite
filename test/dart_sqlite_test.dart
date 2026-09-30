@@ -235,6 +235,64 @@ void main() {
   assert(createAsDb.select('SELECT * FROM empty_copy').isEmpty);
   assert(createAsDb.select('PRAGMA table_info(empty_copy)').length == 2);
   createAsDb.execute('''
+    CREATE TABLE ctas_type_source (
+      integer_value INTEGER,
+      text_value TEXT,
+      numeric_value NUMERIC,
+      real_value REAL,
+      blob_value BLOB
+    )
+  ''');
+  createAsDb.execute('''
+    CREATE TABLE ctas_type_copy AS
+    SELECT integer_value, text_value, numeric_value, real_value, blob_value,
+           CAST(integer_value AS INTEGER) AS cast_integer,
+           CAST(text_value AS VARCHAR(20)) AS cast_text,
+           (integer_value) AS parenthesized,
+           +integer_value AS unary_plus,
+           integer_value + 1 AS calculated
+    FROM ctas_type_source WHERE 0
+  ''');
+  assert(
+    createAsDb
+            .select('PRAGMA table_info(ctas_type_copy)')
+            .map((row) => row['type'])
+            .join(',') ==
+        'INT,TEXT,NUM,REAL,,INT,TEXT,INT,,',
+  );
+  createAsDb.execute('''
+    CREATE TABLE ctas_type_star AS
+    SELECT * FROM ctas_type_source WHERE 0
+  ''');
+  assert(
+    createAsDb
+            .select('PRAGMA table_info(ctas_type_star)')
+            .map((row) => row['type'])
+            .join(',') ==
+        'INT,TEXT,NUM,REAL,',
+  );
+  createAsDb.execute('''
+    CREATE TABLE ctas_type_cte AS
+    WITH typed AS (SELECT integer_value FROM ctas_type_source)
+    SELECT integer_value FROM typed WHERE 0
+  ''');
+  assert(
+    createAsDb.select('PRAGMA table_info(ctas_type_cte)').single['type'] ==
+        'INT',
+  );
+  createAsDb.execute('''
+    CREATE VIEW ctas_type_view AS
+    SELECT integer_value, CAST(text_value AS DOUBLE) AS cast_real
+    FROM ctas_type_source
+  ''');
+  assert(
+    createAsDb
+            .select('PRAGMA table_info(ctas_type_view)')
+            .map((row) => row['type'])
+            .join(',') ==
+        'INT,REAL',
+  );
+  createAsDb.execute('''
     CREATE TABLE duplicate_copy AS
     SELECT id AS repeated, id + 10 AS repeated FROM source_rows ORDER BY id
   ''');
@@ -427,6 +485,81 @@ void main() {
             .map((row) => row['value'])
             .join(',') ==
         'after,before',
+  );
+
+  final addColumnConstraintsDb = PureDatabase.memory()
+    ..execute('PRAGMA foreign_keys = ON')
+    ..execute('CREATE TABLE add_column_parent (id INTEGER PRIMARY KEY)')
+    ..execute('CREATE TABLE add_column_child (id INTEGER PRIMARY KEY)')
+    ..execute('INSERT INTO add_column_child VALUES (1)')
+    ..execute('''
+      ALTER TABLE add_column_child
+      ADD COLUMN state TEXT NOT NULL DEFAULT 'ready'
+      CHECK (state IN ('ready', 'done'))
+    ''')
+    ..execute('''
+      ALTER TABLE add_column_child
+      ADD COLUMN parent_id INTEGER REFERENCES add_column_parent(id)
+      ON DELETE CASCADE DEFAULT NULL
+    ''');
+  assert(
+    addColumnConstraintsDb
+            .select('SELECT state FROM add_column_child')
+            .single['state'] ==
+        'ready',
+  );
+  assert(
+    addColumnConstraintsDb
+            .select('PRAGMA foreign_key_list(add_column_child)')
+            .single['on_delete'] ==
+        'CASCADE',
+  );
+  addColumnConstraintsDb
+    ..execute('INSERT INTO add_column_parent VALUES (10)')
+    ..execute('UPDATE add_column_child SET parent_id = 10 WHERE id = 1')
+    ..execute('DELETE FROM add_column_parent WHERE id = 10');
+  assert(
+    addColumnConstraintsDb.select('SELECT * FROM add_column_child').isEmpty,
+  );
+
+  final rejectedAddCheckDb = PureDatabase.memory()
+    ..execute('CREATE TABLE rejected_add_check (id INTEGER)')
+    ..execute('INSERT INTO rejected_add_check VALUES (1)');
+  var addCheckRejected = false;
+  try {
+    rejectedAddCheckDb.execute('''
+      ALTER TABLE rejected_add_check
+      ADD COLUMN state TEXT DEFAULT 'bad' CHECK (state <> 'bad')
+    ''');
+  } on SqliteException catch (error) {
+    addCheckRejected = error.message.startsWith('CHECK constraint failed');
+  }
+  assert(addCheckRejected);
+  assert(
+    rejectedAddCheckDb.select('PRAGMA table_info(rejected_add_check)').length ==
+        1,
+  );
+
+  final rejectedAddReferenceDb = PureDatabase.memory()
+    ..execute('PRAGMA foreign_keys = ON')
+    ..execute('CREATE TABLE rejected_add_parent (id INTEGER PRIMARY KEY)')
+    ..execute('CREATE TABLE rejected_add_child (id INTEGER)')
+    ..execute('INSERT INTO rejected_add_child VALUES (1)');
+  var addReferenceRejected = false;
+  try {
+    rejectedAddReferenceDb.execute('''
+      ALTER TABLE rejected_add_child
+      ADD COLUMN parent_id INTEGER DEFAULT 1 REFERENCES rejected_add_parent(id)
+    ''');
+  } on SqliteException catch (error) {
+    addReferenceRejected = error.message.contains('non-NULL default');
+  }
+  assert(addReferenceRejected);
+  assert(
+    rejectedAddReferenceDb
+            .select('PRAGMA table_info(rejected_add_child)')
+            .length ==
+        1,
   );
 
   final temporaryForeignKeyDb = PureDatabase.memory()
@@ -1353,6 +1486,68 @@ void main() {
             .single['new_name'] ==
         'updated',
   );
+  final triggerJoinRenameDb = PureDatabase.memory()
+    ..execute(
+      'CREATE TABLE trigger_join_target (id INTEGER PRIMARY KEY, old_name TEXT)',
+    )
+    ..execute('CREATE TABLE trigger_join_aux (target_id INTEGER)')
+    ..execute('CREATE TABLE trigger_join_input (id INTEGER)')
+    ..execute('CREATE TABLE trigger_join_audit (value TEXT)')
+    ..execute('INSERT INTO trigger_join_target VALUES (1, \'joined\')')
+    ..execute('INSERT INTO trigger_join_aux VALUES (1)')
+    ..execute('''
+      CREATE TRIGGER trigger_join_input_ai AFTER INSERT ON trigger_join_input
+      BEGIN
+        INSERT INTO trigger_join_audit
+        SELECT trigger_join_target.old_name
+        FROM trigger_join_target
+        JOIN trigger_join_aux
+          ON trigger_join_aux.target_id = trigger_join_target.id
+        WHERE trigger_join_target.id = NEW.id;
+      END
+    ''')
+    ..execute(
+      'ALTER TABLE trigger_join_target RENAME COLUMN old_name TO new_name',
+    )
+    ..execute('INSERT INTO trigger_join_input VALUES (1)');
+  assert(
+    triggerJoinRenameDb
+            .select('SELECT value FROM trigger_join_audit')
+            .single['value'] ==
+        'joined',
+  );
+  final triggerCompoundRenameDb = PureDatabase.memory()
+    ..execute(
+      'CREATE TABLE trigger_compound_target (id INTEGER PRIMARY KEY, old_name TEXT)',
+    )
+    ..execute('CREATE TABLE trigger_compound_other (old_name TEXT)')
+    ..execute('CREATE TABLE trigger_compound_input (id INTEGER)')
+    ..execute('CREATE TABLE trigger_compound_audit (value TEXT)')
+    ..execute("INSERT INTO trigger_compound_target VALUES (1, 'target')")
+    ..execute("INSERT INTO trigger_compound_other VALUES ('other')")
+    ..execute('''
+      CREATE TRIGGER trigger_compound_input_ai AFTER INSERT
+      ON trigger_compound_input BEGIN
+        INSERT INTO trigger_compound_audit
+        SELECT t.old_name FROM trigger_compound_target AS t
+        UNION ALL
+        SELECT o.old_name FROM trigger_compound_other AS o;
+      END
+    ''')
+    ..execute('''
+      ALTER TABLE trigger_compound_target
+      RENAME COLUMN old_name TO new_name
+    ''')
+    ..execute('INSERT INTO trigger_compound_input VALUES (1)');
+  final compoundTriggerValues = triggerCompoundRenameDb
+      .select('SELECT value FROM trigger_compound_audit ORDER BY value')
+      .map((row) => row['value'])
+      .toList();
+  assert(
+    compoundTriggerValues.length == 2 &&
+        compoundTriggerValues[0] == 'other' &&
+        compoundTriggerValues[1] == 'target',
+  );
   final unrelatedTriggerDb = PureDatabase.memory()
     ..execute(
       'CREATE TABLE trigger_unrelated_rename_target (id INTEGER, old_name TEXT)',
@@ -1691,9 +1886,9 @@ void main() {
         0,
   );
   final joined = fkDb.select(
-    'SELECT files.id, folders.id FROM files JOIN folders ON files.folder_id = folders.id',
+    'SELECT files.id AS file_id, folders.id AS folder_id FROM files JOIN folders ON files.folder_id = folders.id',
   );
-  assert(joined.single['files.id'] == 'file');
+  assert(joined.single['file_id'] == 'file');
   fkDb.execute(
     'CREATE TABLE composite_parent (a TEXT, b TEXT, PRIMARY KEY (a, b))',
   );
@@ -1721,12 +1916,12 @@ void main() {
   assert(fkDb.select('SELECT * FROM composite_child').isEmpty);
   fkDb.execute('INSERT INTO folders VALUES (?)', ['empty']);
   final leftJoined = fkDb.select(
-    'SELECT folders.id, files.id FROM folders LEFT JOIN files ON files.folder_id = folders.id ORDER BY folders.id',
+    'SELECT folders.id AS folder_id, files.id AS file_id FROM folders LEFT JOIN files ON files.folder_id = folders.id ORDER BY folders.id',
   );
-  assert(leftJoined.last['folders.id'] == 'folder');
-  assert(leftJoined.last['files.id'] == 'file');
-  assert(leftJoined.first['folders.id'] == 'empty');
-  assert(leftJoined.first['files.id'] == null);
+  assert(leftJoined.last['folder_id'] == 'folder');
+  assert(leftJoined.last['file_id'] == 'file');
+  assert(leftJoined.first['folder_id'] == 'empty');
+  assert(leftJoined.first['file_id'] == null);
 
   final cascadeDb = PureDatabase.memory();
   cascadeDb.execute('CREATE TABLE cascade_parent (id INTEGER PRIMARY KEY)');
@@ -2869,31 +3064,31 @@ void main() {
   );
   dropColumnDb
     ..execute('CREATE TABLE drop_dependent_view (remove_me TEXT, keep TEXT)')
+    ..execute("INSERT INTO drop_dependent_view VALUES ('gone', 'visible')")
     ..execute('''
       CREATE VIEW drop_dependent_view_projection AS
       SELECT remove_me FROM drop_dependent_view
-    ''');
+    ''')
+    ..execute('ALTER TABLE drop_dependent_view DROP COLUMN remove_me');
+  var dependentViewFailsOnUse = false;
   try {
-    dropColumnDb.execute(
-      'ALTER TABLE drop_dependent_view DROP COLUMN remove_me',
-    );
-    assert(false, 'dropping a view-dependent column should fail');
-  } on PureSqlException {
-    // Expected; the view projects the removed column.
+    dropColumnDb.select('SELECT * FROM drop_dependent_view_projection');
+  } on PureSqlException catch (error) {
+    dependentViewFailsOnUse = error.message.contains('no such column');
   }
+  assert(dependentViewFailsOnUse);
   dropColumnDb
     ..execute('CREATE TABLE drop_wildcard_view (remove_me TEXT, keep TEXT)')
+    ..execute("INSERT INTO drop_wildcard_view VALUES ('gone', 'visible')")
     ..execute(
       'CREATE VIEW drop_wildcard_view_projection AS SELECT * FROM drop_wildcard_view',
-    );
-  try {
-    dropColumnDb.execute(
-      'ALTER TABLE drop_wildcard_view DROP COLUMN remove_me',
-    );
-    assert(false, 'dropping a wildcard-view column should fail');
-  } on PureSqlException {
-    // Expected; the view's output shape includes every source column.
-  }
+    )
+    ..execute('ALTER TABLE drop_wildcard_view DROP COLUMN remove_me');
+  final wildcardViewAfterDrop = dropColumnDb
+      .select('SELECT * FROM drop_wildcard_view_projection')
+      .single;
+  assert(wildcardViewAfterDrop.length == 1);
+  assert(wildcardViewAfterDrop['keep'] == 'visible');
   dropColumnDb.execute('''
     CREATE TABLE drop_unindexed_column (
       id INTEGER PRIMARY KEY,
@@ -3599,6 +3794,8 @@ void main() {
            GLOB('a*', 'abc') AS glob_function,
            UNHEX('4D-5A', '-') AS decoded,
            UNHEX('4D-A5', 'A-') AS hex_ignore,
+           UNHEX('-4D--5A-', '-') AS byte_separators,
+           UNHEX('4-D', '-') AS split_byte,
            UNHEX('4D5', '-') AS invalid_hex,
            IF(0, 'first', 1, 'second', 'else') AS if_branch,
            IIF(0, 'first', 1, 'second', 'else') AS later_branch,
@@ -3609,6 +3806,10 @@ void main() {
   assert(patternFunctions['glob_function'] == true);
   assert((patternFunctions['decoded'] as List<int>).join(',') == '77,90');
   assert((patternFunctions['hex_ignore'] as List<int>).join(',') == '77,165');
+  assert(
+    (patternFunctions['byte_separators'] as List<int>).join(',') == '77,90',
+  );
+  assert(patternFunctions['split_byte'] == null);
   assert(patternFunctions['invalid_hex'] == null);
   assert(patternFunctions['if_branch'] == 'second');
   assert(patternFunctions['later_branch'] == 'second');
@@ -4651,23 +4852,113 @@ void main() {
     'analysis_limit',
     'automatic_index',
     'cache_size',
+    'count_changes',
     'default_cache_size',
     'collation_list',
     'compile_options',
     'database_list',
     'foreign_key_check',
     'foreign_key_list',
+    'full_column_names',
     'function_list',
     'index_info',
     'index_list',
     'index_xinfo',
     'journal_size_limit',
     'read_uncommitted',
+    'short_column_names',
     'temp_store',
     'wal_autocheckpoint',
   ]) {
     assert(pragmaNames.contains(pragma), 'pragma_list should include $pragma');
   }
+  final columnNameDb = PureDatabase.memory()
+    ..execute('CREATE TABLE pragma_column_names (value TEXT)')
+    ..execute("INSERT INTO pragma_column_names VALUES ('ok')");
+  assert(
+    columnNameDb
+            .select('PRAGMA full_column_names')
+            .single['full_column_names'] ==
+        0,
+  );
+  assert(
+    columnNameDb
+            .select('PRAGMA short_column_names')
+            .single['short_column_names'] ==
+        1,
+  );
+  assert(
+    columnNameDb
+            .select('SELECT pragma_column_names.value FROM pragma_column_names')
+            .single
+            .keys
+            .single ==
+        'value',
+  );
+  columnNameDb.execute('PRAGMA short_column_names = OFF');
+  assert(
+    columnNameDb
+            .select('SELECT pragma_column_names.value FROM pragma_column_names')
+            .single
+            .keys
+            .single ==
+        'pragma_column_names.value',
+  );
+  columnNameDb.execute('PRAGMA full_column_names = ON');
+  assert(
+    columnNameDb
+            .select('SELECT value FROM pragma_column_names')
+            .single
+            .keys
+            .single ==
+        'pragma_column_names.value',
+  );
+  assert(
+    columnNameDb
+            .select('SELECT source.value FROM pragma_column_names AS source')
+            .single
+            .keys
+            .single ==
+        'pragma_column_names.value',
+  );
+  assert(
+    columnNameDb
+            .select('''
+              SELECT value, COUNT(*) AS row_count
+              FROM pragma_column_names GROUP BY value
+            ''')
+            .single
+            .keys
+            .first ==
+        'pragma_column_names.value',
+  );
+  assert(
+    columnNameDb
+            .select('SELECT rowid FROM pragma_column_names')
+            .single
+            .keys
+            .single ==
+        'pragma_column_names.rowid',
+  );
+  assert(
+    columnNameDb
+            .select('SELECT value AS explicit_name FROM pragma_column_names')
+            .single
+            .keys
+            .single ==
+        'explicit_name',
+  );
+  assert(
+    columnNameDb
+            .select('SELECT * FROM pragma_column_names')
+            .single
+            .keys
+            .single ==
+        'value',
+  );
+  columnNameDb
+    ..execute('PRAGMA full_column_names = OFF')
+    ..execute('PRAGMA short_column_names = ON');
   assert(
     compatible
             .select('PRAGMA default_cache_size')
@@ -4728,6 +5019,37 @@ void main() {
     compatible.select('PRAGMA read_uncommitted').single['read_uncommitted'] ==
         0,
   );
+
+  final countChangesDb = PureDatabase.memory()
+    ..execute('PRAGMA count_changes = ON')
+    ..execute('CREATE TABLE count_changes_probe (id INTEGER)');
+  assert(
+    countChangesDb.select('PRAGMA count_changes').single['count_changes'] == 1,
+  );
+  final insertedCount = countChangesDb.select(
+    'INSERT INTO count_changes_probe VALUES (1), (2)',
+  );
+  assert(insertedCount.single['rows inserted'] == 2);
+  final zeroUpdateCount = countChangesDb.select(
+    'UPDATE count_changes_probe SET id = 3 WHERE id = 99',
+  );
+  assert(zeroUpdateCount.single['rows updated'] == 0);
+  final updatedCount = countChangesDb.select(
+    'UPDATE count_changes_probe SET id = id + 1',
+  );
+  assert(updatedCount.single['rows updated'] == 2);
+  final deletedCount = countChangesDb.select(
+    'DELETE FROM count_changes_probe WHERE id > 0',
+  );
+  assert(deletedCount.single['rows deleted'] == 2);
+  countChangesDb.execute('PRAGMA count_changes = OFF');
+  var countChangesSelectDisabled = false;
+  try {
+    countChangesDb.select('DELETE FROM count_changes_probe');
+  } on PureSqlException {
+    countChangesSelectDisabled = true;
+  }
+  assert(countChangesSelectDisabled);
 
   final tempStoreDb = PureDatabase.memory()
     ..execute('CREATE TABLE main_temp_store_probe (value INTEGER)')
@@ -5722,14 +6044,14 @@ void main() {
   ''');
   assert(qualifiedDerivedColumn.first.values.single == 'a');
   final joinedDerivedTables = compatible.select('''
-    SELECT names.name, wanted.value
+    SELECT names.name AS name, wanted.value AS wanted_value
     FROM (SELECT DISTINCT "group name" AS name FROM "group") AS names
     LEFT JOIN (SELECT value FROM wanted) AS wanted ON names.name = wanted.value
     ORDER BY names.name
   ''');
   assert(joinedDerivedTables.length == 2);
-  assert(joinedDerivedTables.first['wanted.value'] == 'a');
-  assert(joinedDerivedTables.last['wanted.value'] == null);
+  assert(joinedDerivedTables.first['wanted_value'] == 'a');
+  assert(joinedDerivedTables.last['wanted_value'] == null);
   final subqueryNull = compatible.select('''
     SELECT NULL IN (SELECT value FROM wanted) AS in_null,
            NULL NOT IN (SELECT value FROM wanted) AS not_in_null,
@@ -6131,4 +6453,39 @@ void main() {
   } on PureSqlException {
     // Expected.
   }
+
+  final rowIdDml = PureDatabase.memory()
+    ..execute('CREATE TABLE rowid_aliases (id INTEGER PRIMARY KEY, value)')
+    ..execute('CREATE TABLE implicit_rowid (value)')
+    ..execute("INSERT INTO implicit_rowid(rowid, value) VALUES (42, 'before')");
+  final implicitUpdate = rowIdDml.select(
+    "UPDATE implicit_rowid SET _rowid_ = rowid - 35 "
+    'WHERE oid = 42 RETURNING rowid',
+  );
+  assert(implicitUpdate.single['rowid'] == 7);
+  final primaryKeyInsert = rowIdDml.select(
+    "INSERT INTO rowid_aliases(rowid, value) VALUES (21, 'before') "
+    'RETURNING id, rowid',
+  );
+  assert(primaryKeyInsert.single['id'] == 21);
+  assert(primaryKeyInsert.single['rowid'] == 21);
+  final primaryKeyUpdate = rowIdDml.select(
+    'UPDATE rowid_aliases SET oid = 22 WHERE id = 21 RETURNING id, rowid',
+  );
+  assert(primaryKeyUpdate.single['id'] == 22);
+  assert(primaryKeyUpdate.single['rowid'] == 22);
+  rowIdDml
+    ..execute('CREATE TABLE rowid_audit (old_id, new_id)')
+    ..execute('''
+      CREATE TRIGGER implicit_rowid_audit AFTER UPDATE ON implicit_rowid
+      BEGIN
+        INSERT INTO rowid_audit VALUES (OLD.rowid, NEW.oid);
+      END
+    ''')
+    ..execute('UPDATE implicit_rowid SET rowid = rowid + 1 WHERE rowid = 7');
+  final rowIdAudit = rowIdDml
+      .select('SELECT old_id, new_id FROM rowid_audit')
+      .single;
+  assert(rowIdAudit['old_id'] == 7);
+  assert(rowIdAudit['new_id'] == 8);
 }
