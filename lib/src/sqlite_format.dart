@@ -44,6 +44,7 @@ class SqliteDatabaseHeader {
     this.reservedBytes = 0,
     this.firstFreelistTrunkPage = 0,
     this.freelistPageCount = 0,
+    this.changeCounter = 1,
     this.databaseSizeInPages = 1,
     this.schemaCookie = 1,
     this.schemaFormat = 4,
@@ -83,6 +84,7 @@ class SqliteDatabaseHeader {
       reservedBytes: bytes[20],
       firstFreelistTrunkPage: _readU32(bytes, 32),
       freelistPageCount: _readU32(bytes, 36),
+      changeCounter: _readU32(bytes, 24),
       databaseSizeInPages: _readU32(bytes, 28),
       schemaCookie: _readU32(bytes, 40),
       schemaFormat: _readU32(bytes, 44),
@@ -105,6 +107,7 @@ class SqliteDatabaseHeader {
   int reservedBytes;
   int firstFreelistTrunkPage;
   int freelistPageCount;
+  int changeCounter;
   int databaseSizeInPages;
   int schemaCookie;
   int schemaFormat;
@@ -126,7 +129,7 @@ class SqliteDatabaseHeader {
     bytes[21] = 64;
     bytes[22] = 32;
     bytes[23] = 32;
-    _writeU32(bytes, 24, 1);
+    _writeU32(bytes, 24, changeCounter);
     _writeU32(bytes, 28, databaseSizeInPages);
     _writeU32(bytes, 32, firstFreelistTrunkPage);
     _writeU32(bytes, 36, freelistPageCount);
@@ -360,6 +363,7 @@ class SqlitePagerSavepoint {
     required this.walMode,
     required this.pageCount,
     required this.headerBytes,
+    required this.hasWrittenPages,
     this.databaseBytes,
     this.walPages,
   });
@@ -367,6 +371,7 @@ class SqlitePagerSavepoint {
   final bool walMode;
   final int pageCount;
   final Uint8List headerBytes;
+  final bool hasWrittenPages;
   final Uint8List? databaseBytes;
   final Map<int, Uint8List>? walPages;
 }
@@ -412,6 +417,7 @@ class SqlitePagerSync {
   var _hasExclusiveLock = false;
   var _hasSharedLock = false;
   var _hasWalWriterLock = false;
+  var _hasWrittenPages = false;
   var _closed = false;
 
   static final Map<String, _DatabaseFile> _databaseFiles = {};
@@ -511,6 +517,29 @@ class SqlitePagerSync {
 
   int get pageCount => _pageCount;
 
+  String get dataVersionToken {
+    final databaseStat = File(_path).statSync();
+    final walPath = SqliteWal.pathFor(_path);
+    final walStat = File(walPath).statSync();
+    final snapshot = _walSnapshot;
+    return [
+      header.changeCounter,
+      databaseStat.modified.microsecondsSinceEpoch,
+      databaseStat.size,
+      if (walStat.type != FileSystemEntityType.notFound) ...[
+        walStat.modified.microsecondsSinceEpoch,
+        walStat.size,
+      ],
+      if (snapshot != null) ...[
+        snapshot.salt1,
+        snapshot.salt2,
+        snapshot.validLength,
+        snapshot.checksum.$1,
+        snapshot.checksum.$2,
+      ],
+    ].join(':');
+  }
+
   int get maxPageCount => _maxPageCount;
   set maxPageCount(int value) {
     if (value <= 0) return;
@@ -534,8 +563,12 @@ class SqlitePagerSync {
         : firstPage.length;
     resizedPage.setRange(0, copiedLength, firstPage);
     header.pageSize = pageSize;
+    header
+      ..changeCounter = (header.changeCounter + 1) & 0xffffffff
+      ..versionValidFor = header.changeCounter;
     resizedPage.setRange(0, 100, header.toBytes());
     _databaseFile.writeAll(resizedPage, flush: synchronous >= 2);
+    _hasWrittenPages = false;
   }
 
   void resetForVacuum() {
@@ -549,6 +582,7 @@ class SqlitePagerSync {
       readVersion: previous.readVersion,
       schemaCookie: previous.schemaCookie,
       schemaFormat: previous.schemaFormat,
+      changeCounter: previous.changeCounter,
       defaultCacheSize: previous.defaultCacheSize,
       textEncoding: previous.textEncoding,
       userVersion: previous.userVersion,
@@ -557,6 +591,7 @@ class SqlitePagerSync {
       sqliteVersion: previous.sqliteVersion,
     );
     _pageCount = 1;
+    _hasWrittenPages = true;
     _newDatabase = false;
     final firstPage = Uint8List(header.pageSize)
       ..setRange(0, 100, header.toBytes())
@@ -584,6 +619,7 @@ class SqlitePagerSync {
       readVersion: 1,
       schemaCookie: previous.schemaCookie,
       schemaFormat: previous.schemaFormat,
+      changeCounter: previous.changeCounter,
       defaultCacheSize: previous.defaultCacheSize,
       textEncoding: previous.textEncoding,
       userVersion: previous.userVersion,
@@ -593,6 +629,7 @@ class SqlitePagerSync {
     );
     _walMode = false;
     _pageCount = 1;
+    _hasWrittenPages = true;
     _newDatabase = false;
     final firstPage = Uint8List(header.pageSize)
       ..setRange(0, 100, header.toBytes())
@@ -628,6 +665,7 @@ class SqlitePagerSync {
         walMode: true,
         pageCount: _pageCount,
         headerBytes: Uint8List.fromList(header.toBytes()),
+        hasWrittenPages: _hasWrittenPages,
         walPages: {
           for (final entry in pending.entries)
             entry.key: Uint8List.fromList(entry.value),
@@ -639,6 +677,7 @@ class SqlitePagerSync {
       walMode: false,
       pageCount: _pageCount,
       headerBytes: Uint8List.fromList(header.toBytes()),
+      hasWrittenPages: _hasWrittenPages,
       databaseBytes: _databaseFile.readAll(),
     );
   }
@@ -655,6 +694,7 @@ class SqlitePagerSync {
       _pageCount = savepoint.pageCount;
       header = SqliteDatabaseHeader.fromBytes(savepoint.headerBytes);
       header.databaseSizeInPages = _pageCount;
+      _hasWrittenPages = savepoint.hasWrittenPages;
       return;
     }
     if (_walMode || savepoint.databaseBytes == null) {
@@ -664,6 +704,7 @@ class SqlitePagerSync {
     header = SqliteDatabaseHeader.fromBytes(savepoint.headerBytes);
     _pageCount = savepoint.pageCount;
     header.databaseSizeInPages = _pageCount;
+    _hasWrittenPages = savepoint.hasWrittenPages;
   }
 
   void refresh() {
@@ -731,8 +772,10 @@ class SqlitePagerSync {
     if (pending == null) throw StateError('no WAL transaction is active');
     if (pending.isEmpty) {
       _pendingWalPages = null;
+      _hasWrittenPages = false;
       return;
     }
+    prepareChangeCounter();
     SqliteWal.append(
       _path,
       pageSize: header.pageSize,
@@ -741,6 +784,7 @@ class SqlitePagerSync {
       flush: synchronous >= 2,
     );
     _pendingWalPages = null;
+    finishChanges();
     refresh();
     if (walAutoCheckpointPages > 0 && walFrameCount >= walAutoCheckpointPages) {
       checkpointWal('PASSIVE');
@@ -852,10 +896,31 @@ class SqlitePagerSync {
       : (snapshot.validLength - 32) ~/ (24 + header.pageSize);
 
   void rollbackWalTransaction() {
-    if (_pendingWalPages == null) return;
+    if (_pendingWalPages == null) {
+      _hasWrittenPages = false;
+      return;
+    }
     _pendingWalPages = null;
+    _hasWrittenPages = false;
     refresh();
   }
+
+  void prepareChangeCounter() {
+    if (!_hasWrittenPages) return;
+    header
+      ..changeCounter = (header.changeCounter + 1) & 0xffffffff
+      ..versionValidFor = header.changeCounter;
+    final firstPage = readPage(1)..setRange(0, 100, header.toBytes());
+    if (_walMode && _pendingWalPages == null) {
+      _writePage(1, firstPage);
+    } else {
+      writePage(1, firstPage);
+    }
+  }
+
+  void finishChanges() => _hasWrittenPages = false;
+
+  void discardChanges() => _hasWrittenPages = false;
 
   void enableWalMode() {
     if (_walMode) return;
@@ -867,6 +932,7 @@ class SqlitePagerSync {
     pageOne.setRange(0, 100, header.toBytes());
     SqliteWal.initialize(_path, header.pageSize, flush: synchronous > 0);
     _writePage(1, pageOne);
+    _hasWrittenPages = true;
     refresh();
   }
 
@@ -896,11 +962,14 @@ class SqlitePagerSync {
       )..databaseSizeInPages = pageCount;
       nextHeader
         ..writeVersion = 1
-        ..readVersion = 1;
+        ..readVersion = 1
+        ..changeCounter = (nextHeader.changeCounter + 1) & 0xffffffff
+        ..versionValidFor = nextHeader.changeCounter;
       database.setRange(0, 100, nextHeader.toBytes());
       _databaseFile.writeAll(database, flush: synchronous >= 2);
       if (synchronous == 1) syncDatabase();
       journal.commit();
+      _hasWrittenPages = false;
       final wal = File(SqliteWal.pathFor(_path));
       if (wal.existsSync()) wal.deleteSync();
       refresh();
@@ -1037,6 +1106,7 @@ class SqlitePagerSync {
       throw SqliteFormatException('page write has invalid size or number');
     }
     _newDatabase = false;
+    _hasWrittenPages = true;
     if (pageNumber > _pageCount) _pageCount = pageNumber;
     header.databaseSizeInPages = _pageCount;
     if (_walMode) {
@@ -1547,6 +1617,19 @@ class SqliteRollbackJournal {
     }
     final pageSize = _readU32(bytes, 24);
     final sectorSize = _readU32(bytes, 20);
+    final recordEnd = sectorSize + _readU32(bytes, 8) * (pageSize + 8);
+    final pointerOffset =
+        ((recordEnd + sectorSize - 1) ~/ sectorSize) * sectorSize;
+    var journalLength = bytes.length;
+    if (_readMasterJournalPath(bytes, pointerOffset, pageSize) != null) {
+      final existing = file.openSync(mode: FileMode.append);
+      try {
+        existing.truncateSync(pointerOffset);
+        journalLength = pointerOffset;
+      } finally {
+        existing.closeSync();
+      }
+    }
     final name = utf8.encode(File(masterJournalPath).absolute.path);
     final pointer = Uint8List(name.length + 20);
     _writeU32(pointer, 0, 0x40000000 ~/ pageSize + 1);
@@ -1560,11 +1643,11 @@ class SqliteRollbackJournal {
     pointer.setRange(12 + name.length, pointer.length, _rollbackJournalMagic);
 
     final alignedLength =
-        ((bytes.length + sectorSize - 1) ~/ sectorSize) * sectorSize;
+        ((journalLength + sectorSize - 1) ~/ sectorSize) * sectorSize;
     final output = file.openSync(mode: FileMode.append);
     try {
-      if (alignedLength > bytes.length) {
-        output.writeFromSync(Uint8List(alignedLength - bytes.length));
+      if (alignedLength > journalLength) {
+        output.writeFromSync(Uint8List(alignedLength - journalLength));
       }
       output.writeFromSync(pointer);
       output.flushSync();

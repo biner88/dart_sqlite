@@ -82,6 +82,7 @@ const _supportedPragmaNames = {
   'collation_list',
   'compile_options',
   'count_changes',
+  'data_version',
   'database_list',
   'default_cache_size',
   'defer_foreign_keys',
@@ -128,6 +129,7 @@ const _pragmaTableFunctionColumns = {
   'auto_vacuum': ['auto_vacuum'],
   'collation_list': ['seq', 'name'],
   'compile_options': ['compile_options'],
+  'data_version': ['data_version'],
   'database_list': ['seq', 'name', 'file'],
   'encoding': ['encoding'],
   'freelist_count': ['freelist_count'],
@@ -471,6 +473,7 @@ class PureDatabase {
       } else {
         pager.withExclusiveLock(refresh);
       }
+      database._observeDataVersion();
       if (pager.header.defaultCacheSize != 0) {
         database._cacheSize = pager.header.defaultCacheSize;
       }
@@ -548,6 +551,8 @@ class PureDatabase {
   var _changes = 0;
   var _totalChanges = 0;
   var _lastInsertRowId = 0;
+  var _dataVersion = 1;
+  String? _lastObservedDataVersionToken;
   var _deferForeignKeys = false;
   var _recursiveTriggers = false;
   var _temporaryDatabaseOpened = false;
@@ -2147,6 +2152,7 @@ class PureDatabase {
           pager.acquireWalWriterLock();
           try {
             _refreshFile();
+            _observeDataVersion();
             if (!pager.isWalMode) {
               pager.releaseWalWriterLock();
               continue;
@@ -2162,6 +2168,7 @@ class PureDatabase {
           pager.acquireExclusiveLock();
           try {
             _refreshFile();
+            _observeDataVersion();
             if (pager.isWalMode) {
               pager.releaseExclusiveLock();
               continue;
@@ -2230,9 +2237,12 @@ class PureDatabase {
       if (_walTransaction) {
         _pager!.commitWalTransaction();
       } else {
+        _pager?.prepareChangeCounter();
         if (_synchronous == 1) _pager?.syncDatabase();
         _transactionJournal?.commit(sizeLimit: _journalSizeLimit);
+        _pager?.finishChanges();
       }
+      _observeDataVersion(ownCommit: true);
       _finishVirtualTableDrops(commit: true);
       _dirtyVirtualTables.clear();
     } catch (_) {
@@ -2299,6 +2309,7 @@ class PureDatabase {
         journal.setSuperJournal(masterJournal.path);
       }
       for (final database in persistentParticipants) {
+        database._pager!.prepareChangeCounter();
         database._pager!.syncDatabase();
       }
       try {
@@ -2349,6 +2360,8 @@ class PureDatabase {
         firstError ??= error;
       }
       database._transactionJournal = null;
+      database._pager?.finishChanges();
+      database._observeDataVersion(ownCommit: true);
       try {
         database._finishVirtualTableDrops(commit: true);
       } catch (error) {
@@ -2458,6 +2471,7 @@ class PureDatabase {
         );
         _refreshFile(virtualTableSources: _memoryTransactionTables);
       } finally {
+        _pager!.discardChanges();
         _transactionJournal = null;
         _memoryTransactionTables = null;
         _temporaryTables = _memoryTransactionTemporaryTables!;
@@ -2499,6 +2513,7 @@ class PureDatabase {
     _transactionAttachedDatabases.clear();
     _finishVirtualTableDrops(commit: false);
     _dirtyVirtualTables.clear();
+    _observeDataVersion(ownCommit: true);
     if (attachedRollbackError != null) throw attachedRollbackError;
     return 0;
   }
@@ -2639,8 +2654,11 @@ class PureDatabase {
     );
     try {
       final result = action();
+      _pager!.prepareChangeCounter();
       if (_synchronous == 1) _pager?.syncDatabase();
       journal.commit(sizeLimit: _journalSizeLimit);
+      _pager!.finishChanges();
+      _observeDataVersion(ownCommit: true);
       return result;
     } catch (_) {
       journal.rollback(
@@ -2648,7 +2666,9 @@ class PureDatabase {
         databaseHandle: _pager!.databaseHandle,
         sizeLimit: _journalSizeLimit,
       );
+      _pager!.discardChanges();
       _refreshFile(virtualTableSources: virtualTableSources);
+      _observeDataVersion(ownCommit: true);
       rethrow;
     }
   }
@@ -2660,6 +2680,7 @@ class PureDatabase {
         pager.acquireWalWriterLock();
         try {
           _refreshFile();
+          _observeDataVersion();
           if (!pager.isWalMode) continue;
           final virtualTableSnapshot = _cloneVirtualTables(_tables);
           final temporaryVirtualTableSnapshot = _cloneVirtualTables(
@@ -2669,6 +2690,7 @@ class PureDatabase {
           try {
             final result = action();
             pager.commitWalTransaction();
+            _observeDataVersion(ownCommit: true);
             _finishVirtualTableDrops(commit: true);
             _dirtyVirtualTables.clear();
             return result;
@@ -2677,6 +2699,7 @@ class PureDatabase {
             _restoreVirtualTableSnapshots(virtualTableSnapshot);
             _restoreVirtualTableSnapshots(temporaryVirtualTableSnapshot);
             _refreshFile(virtualTableSources: virtualTableSnapshot);
+            _observeDataVersion(ownCommit: true);
             _finishVirtualTableDrops(commit: false);
             _dirtyVirtualTables.clear();
             rethrow;
@@ -2688,6 +2711,7 @@ class PureDatabase {
       pager.acquireExclusiveLock();
       try {
         _refreshFile();
+        _observeDataVersion();
         if (pager.isWalMode) continue;
         final virtualTableSnapshot = _cloneVirtualTables(_tables);
         final temporaryVirtualTableSnapshot = _cloneVirtualTables(
@@ -2730,6 +2754,7 @@ class PureDatabase {
     if (mode == 'wal') {
       final result = pager.withExclusiveLock(() {
         _refreshFile();
+        _observeDataVersion();
         if (pager.isWalMode) return 0;
         return _journalled(() {
           pager.enableWalMode();
@@ -2737,10 +2762,12 @@ class PureDatabase {
         }, journalMode: 'delete');
       });
       _journalMode = 'wal';
+      _observeDataVersion(ownCommit: true);
       return result;
     }
     final result = pager.withExclusiveLock(() {
       _refreshFile();
+      _observeDataVersion();
       if (pager.isWalMode) pager.disableWalMode();
       _refreshFile();
       if (const {'delete', 'memory', 'off'}.contains(mode)) {
@@ -2750,6 +2777,7 @@ class PureDatabase {
       return 0;
     });
     _journalMode = mode;
+    _observeDataVersion(ownCommit: true);
     return result;
   }
 
@@ -2800,6 +2828,19 @@ class PureDatabase {
         _disposeVirtualTable(module);
       }
     }
+  }
+
+  void _observeDataVersion({bool ownCommit = false}) {
+    final token = _pager?.dataVersionToken;
+    if (token == null) return;
+    final previous = _lastObservedDataVersionToken;
+    if (previous != null &&
+        token != previous &&
+        !ownCommit &&
+        !_inTransaction) {
+      _dataVersion++;
+    }
+    _lastObservedDataVersionToken = token;
   }
 
   void _refreshVirtualTableRows(_Table table) {
@@ -5346,7 +5387,14 @@ class PureDatabase {
       throw PureSqlException('invalid wal_checkpoint mode: $mode');
     }
     final pager = _pager;
+    if (pager?.isWalMode == true && !_inTransaction) {
+      pager!.refresh();
+      _observeDataVersion();
+    }
     final result = pager?.checkpointWal(mode) ?? (0, -1, -1);
+    if (pager != null && mode != 'NOOP' && result.$1 == 0) {
+      _observeDataVersion(ownCommit: true);
+    }
     return [
       {'busy': result.$1, 'log': result.$2, 'checkpointed': result.$3},
     ];
@@ -5355,6 +5403,7 @@ class PureDatabase {
   Object? _pragmaValue(_Pragma statement) {
     final name = _key(statement.name);
     if (_key(statement.schema ?? '') == 'temp') {
+      if (name == 'data_version') return 1;
       if (name == 'default_cache_size') {
         final pageCount = _temporaryPragmaValues[name] as int;
         return pageCount == 0 ? -2000 : pageCount;
@@ -5372,6 +5421,10 @@ class PureDatabase {
       if (name == 'encoding') return 'UTF-8';
     }
     if (name == 'analysis_limit') return _analysisLimit;
+    if (name == 'data_version') {
+      _observeDataVersion();
+      return _dataVersion;
+    }
     if (name == 'automatic_index') return _automaticIndex ? 1 : 0;
     if (name == 'threads') return _threads;
     if (name == 'secure_delete') return _secureDeleteMode;
@@ -10519,16 +10572,6 @@ String _replaceSqlTokens(String sql, List<_Token> targets, String newName) {
     return expression is! _Column ||
         _key(expression.name.split('.').last) != _key(columnName);
   });
-  bool usesUnqualifiedName(_Expr? expression) =>
-      expression is _Column &&
-      !expression.name.contains('.') &&
-      _key(expression.name) == _key(columnName);
-  if (aliasedColumnCollision &&
-      (query.orderBy.any((order) => usesUnqualifiedName(order.expression)) ||
-          query.groupBy.any(usesUnqualifiedName) ||
-          usesUnqualifiedName(query.having))) {
-    return (safe: false, tokens: const []);
-  }
   final tokens = _Tokenizer(sql).tokenize();
   final selectIndexes = <int>[];
   for (var index = 0; index < tokens.length; index++) {
@@ -10696,9 +10739,70 @@ String _replaceSqlTokens(String sql, List<_Token> targets, String newName) {
       }
     }
   }
+  final orderAliasTokens = <int>{};
+  if (aliasedColumnCollision) {
+    var orderByStart = -1;
+    var orderByEnd = tokens.length - 1;
+    depth = 0;
+    for (var index = selectIndex + 1; index < tokens.length - 1; index++) {
+      final token = tokens[index];
+      if (token.text == '(') depth++;
+      if (token.text == ')') depth--;
+      if (depth != 0 || token.type != _TokenType.word || token.quoted) {
+        continue;
+      }
+      final word = token.text.toUpperCase();
+      if (orderByStart < 0 &&
+          word == 'ORDER' &&
+          tokens[index + 1].text.toUpperCase() == 'BY') {
+        orderByStart = index + 2;
+      } else if (orderByStart >= 0 &&
+          const {'LIMIT', 'OFFSET'}.contains(word)) {
+        orderByEnd = index;
+        break;
+      }
+    }
+    if (orderByStart >= 0) {
+      var termStart = orderByStart;
+      depth = 0;
+      for (var index = orderByStart; index <= orderByEnd; index++) {
+        if (index < orderByEnd && tokens[index].text == '(') depth++;
+        if (index < orderByEnd && tokens[index].text == ')') depth--;
+        if (index != orderByEnd && !(depth == 0 && tokens[index].text == ',')) {
+          continue;
+        }
+        var termEnd = index;
+        if (termEnd > termStart &&
+            tokens[termEnd - 1].type == _TokenType.word &&
+            !tokens[termEnd - 1].quoted &&
+            const {
+              'ASC',
+              'DESC',
+            }.contains(tokens[termEnd - 1].text.toUpperCase())) {
+          termEnd--;
+        }
+        if (termEnd - termStart >= 2 &&
+            tokens[termEnd - 2].text.toUpperCase() == 'NULLS' &&
+            const {
+              'FIRST',
+              'LAST',
+            }.contains(tokens[termEnd - 1].text.toUpperCase())) {
+          termEnd -= 2;
+        }
+        if (termEnd - termStart == 1 &&
+            tokens[termStart].type == _TokenType.word &&
+            _key(tokens[termStart].text) == _key(columnName)) {
+          orderAliasTokens.add(termStart);
+        }
+        termStart = index + 1;
+      }
+    }
+  }
   final references = <_Token>[];
   for (var index = selectIndex + 1; index < tokens.length - 1; index++) {
-    if (sourceTokens.contains(index) || usingColumnTokens.contains(index)) {
+    if (sourceTokens.contains(index) ||
+        usingColumnTokens.contains(index) ||
+        orderAliasTokens.contains(index)) {
       continue;
     }
     final token = tokens[index];

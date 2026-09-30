@@ -19,7 +19,7 @@ Future<void> main(List<String> args) async {
   if (args.length == 3 && args.first == '--hold-multi-write') {
     final mainPath = args[1];
     final attachedPath = args[2];
-    final database = PureDatabase.open(mainPath)
+    PureDatabase.open(mainPath)
       ..execute('ATTACH DATABASE ? AS aux', [attachedPath])
       ..execute('BEGIN IMMEDIATE')
       ..execute("UPDATE journal_probe SET value = 'after-main'")
@@ -41,6 +41,61 @@ Future<void> main(List<String> args) async {
 
   final directory = Directory.systemTemp.createTempSync('dart_sqlite_db_');
   final path = '${directory.path}/data.sqlite';
+
+  for (final journalMode in const ['delete', 'wal']) {
+    final dataVersionPath =
+        '${directory.path}/data-version-$journalMode.sqlite';
+    final firstConnection = PureDatabase.open(dataVersionPath)
+      ..execute('PRAGMA journal_mode = $journalMode')
+      ..execute('CREATE TABLE data_version_probe (value INTEGER)');
+    final secondConnection = PureDatabase.open(dataVersionPath);
+    final initialVersion = firstConnection
+        .select('PRAGMA data_version')
+        .single['data_version'];
+    firstConnection
+      ..execute('BEGIN')
+      ..execute('INSERT INTO data_version_probe VALUES (0)')
+      ..execute('ROLLBACK');
+    assert(
+      firstConnection.select('PRAGMA data_version').single['data_version'] ==
+          initialVersion,
+      'a rolled-back write does not change data_version',
+    );
+    firstConnection.execute('INSERT INTO data_version_probe VALUES (1)');
+    assert(
+      firstConnection.select('PRAGMA data_version').single['data_version'] ==
+          initialVersion,
+      'a connection does not change its own data_version after commit',
+    );
+    if (journalMode == 'wal') {
+      firstConnection.select('PRAGMA wal_checkpoint(TRUNCATE)');
+      assert(
+        firstConnection.select('PRAGMA data_version').single['data_version'] ==
+            initialVersion,
+        'a checkpoint performed by the same connection does not change data_version',
+      );
+    }
+    secondConnection.execute('INSERT INTO data_version_probe VALUES (2)');
+    final secondConnectionVersion = firstConnection
+        .select('PRAGMA data_version')
+        .single['data_version'];
+    assert(
+      secondConnectionVersion != initialVersion,
+      'another engine connection changes data_version in $journalMode mode',
+    );
+    final nativeWrite = Process.runSync('sqlite3', [
+      dataVersionPath,
+      'INSERT INTO data_version_probe VALUES (3)',
+    ]);
+    assert(nativeWrite.exitCode == 0, nativeWrite.stderr);
+    assert(
+      firstConnection.select('PRAGMA data_version').single['data_version'] !=
+          secondConnectionVersion,
+      'a native SQLite commit changes data_version in $journalMode mode',
+    );
+    secondConnection.close();
+    firstConnection.close();
+  }
 
   final database = PureDatabase.open(path);
   assert(database.select('PRAGMA mmap_size').single['mmap_size'] == 0);
@@ -2592,6 +2647,36 @@ Future<void> main(List<String> args) async {
     '$nativeRecoveryAttachedPath-journal',
     nativeRecoveryMaster.path,
   );
+  final committedRecoveryDirectory = Directory(
+    '${directory.path}/committed-multi-recovery',
+  )..createSync();
+  final committedRecoveryMainPath =
+      '${committedRecoveryDirectory.path}/main.sqlite';
+  final committedRecoveryAttachedPath =
+      '${committedRecoveryDirectory.path}/attached.sqlite';
+  for (final (source, destination) in [
+    (atomicCrashMainPath, committedRecoveryMainPath),
+    (atomicCrashAttachedPath, committedRecoveryAttachedPath),
+  ]) {
+    File(source).copySync(destination);
+    File('$source-journal').copySync('$destination-journal');
+  }
+  final committedRecoveryMaster =
+      SqliteRollbackJournal.createSuperJournal(committedRecoveryMainPath, [
+        '$committedRecoveryMainPath-journal',
+        '$committedRecoveryAttachedPath-journal',
+      ]);
+  SqliteRollbackJournal.setSuperJournalAt(
+    '$committedRecoveryMainPath-journal',
+    committedRecoveryMaster.path,
+  );
+  SqliteRollbackJournal.setSuperJournalAt(
+    '$committedRecoveryAttachedPath-journal',
+    committedRecoveryMaster.path,
+  );
+  File(atomicMainPath).copySync(committedRecoveryMainPath);
+  File(atomicAttachedPath).copySync(committedRecoveryAttachedPath);
+  committedRecoveryMaster.deleteSync();
   atomicWriter.stdin.writeln('exit');
   await atomicWriter.stdin.flush();
   await atomicWriter.exitCode;
@@ -2606,6 +2691,22 @@ Future<void> main(List<String> args) async {
     assert(nativeRecovery.exitCode == 0, nativeRecovery.stderr);
     assert(nativeRecovery.stdout.trim() == 'ok\nbefore', nativeRecovery.stdout);
   }
+  final committedMain = PureDatabase.open(committedRecoveryMainPath);
+  assert(
+    committedMain.select('SELECT value FROM journal_probe').single['value'] ==
+        'committed-main',
+    'a missing super-journal marks the multi-file transaction committed',
+  );
+  committedMain.close();
+  final committedAttached = PureDatabase.open(committedRecoveryAttachedPath);
+  assert(
+    committedAttached
+            .select('SELECT value FROM journal_probe')
+            .single['value'] ==
+        'committed-aux',
+    'all databases preserve their committed state after the commit point',
+  );
+  committedAttached.close();
   final recoveredAtomicMain = PureDatabase.open(atomicCrashMainPath);
   assert(
     recoveredAtomicMain

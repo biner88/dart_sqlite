@@ -198,6 +198,16 @@ void main() {
   assert(pragmaValues['page_count'] == 0);
   assert(pragmaValues['encoding'] == 'UTF-8');
   assert(pragmaValues['auto_vacuum'] == 0);
+  assert(
+    createAsDb.select('PRAGMA data_version').single['data_version'] == 1,
+    'in-memory databases have no external change counter',
+  );
+  assert(
+    createAsDb
+            .select('SELECT data_version FROM pragma_data_version()')
+            .single['data_version'] ==
+        1,
+  );
   assert(pragmaValues['freelist_count'] == 0);
   createAsDb.execute('''
     CREATE TABLE copied_rows AS
@@ -2732,14 +2742,44 @@ void main() {
     CREATE VIEW rename_alias_dependent_view AS
     SELECT label AS old_name FROM rename_alias_view_source ORDER BY old_name
   ''');
-  try {
-    renameColumnDb.execute('''
+  renameColumnDb
+    ..execute("INSERT INTO rename_alias_view_source VALUES ('a', 'Z')")
+    ..execute("INSERT INTO rename_alias_view_source VALUES ('z', 'A')")
+    ..execute('''
       ALTER TABLE rename_alias_view_source RENAME COLUMN old_name TO new_name
     ''');
-    assert(false, 'ambiguous view aliases must not be rewritten');
-  } on PureSqlException {
-    // ORDER BY resolves to the output alias, not necessarily the source column.
-  }
+  assert(
+    renameColumnDb
+            .select('SELECT old_name FROM rename_alias_dependent_view')
+            .map((row) => row['old_name'])
+            .join(',') ==
+        'A,Z',
+    'ORDER BY must continue resolving to the view output alias after rename',
+  );
+  renameColumnDb
+    ..execute('''
+      CREATE TABLE rename_group_alias_source (old_name TEXT, label TEXT)
+    ''')
+    ..execute("INSERT INTO rename_group_alias_source VALUES ('a', 'first')")
+    ..execute("INSERT INTO rename_group_alias_source VALUES ('a', 'again')")
+    ..execute("INSERT INTO rename_group_alias_source VALUES ('b', 'second')")
+    ..execute('''
+      CREATE VIEW rename_group_alias_view AS
+      SELECT label AS old_name, COUNT(*) AS n
+      FROM rename_group_alias_source
+      GROUP BY old_name HAVING old_name <> ''
+    ''')
+    ..execute('''
+      ALTER TABLE rename_group_alias_source RENAME COLUMN old_name TO new_name
+    ''');
+  assert(
+    renameColumnDb
+            .select('SELECT n FROM rename_group_alias_view ORDER BY n')
+            .map((row) => row['n'])
+            .join(',') ==
+        '1,2',
+    'GROUP BY and HAVING names resolve to the source column before its alias',
+  );
   renameColumnDb
     ..execute('CREATE TABLE rename_alias_safe_source (old_name TEXT)')
     ..execute('''
@@ -5572,7 +5612,9 @@ void main() {
             .length ==
         2,
   );
-  assert(compatible.select('PRAGMA database_list').single['name'] == 'main');
+  final compatibleDatabaseList = compatible.select('PRAGMA database_list');
+  assert(compatibleDatabaseList.first['name'] == 'main');
+  assert(compatibleDatabaseList.any((row) => row['name'] == 'temp'));
   final functionList = compatible.select('PRAGMA function_list');
   assert(functionList.isNotEmpty);
   assert(functionList.any((row) => row['name'] == 'LOG'));
