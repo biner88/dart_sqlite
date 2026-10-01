@@ -1560,6 +1560,49 @@ class PureDatabase {
     );
   }
 
+  /// Exports the current database as a SQL script.
+  String exportSql() => _withCurrentFile(() {
+    final output = StringBuffer(
+      'PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n',
+    );
+    for (final table in _tables.values) {
+      final schema = table.schemaSql;
+      if (schema == null || table.virtualTable != null) {
+        throw PureSqlException('cannot export table ${table.name}');
+      }
+      output.writeln('$schema;');
+      final columns = table.columns
+          .map((column) => _quoteSqlIdentifier(column.name))
+          .join(', ');
+      final names = columns.isEmpty ? '' : ' ($columns)';
+      for (final row in table.rows) {
+        output.write(
+          'INSERT INTO ${_quoteSqlIdentifier(table.name)}$names VALUES (',
+        );
+        output.write(
+          table.columns
+              .map((column) => _sqlBackupLiteral(row[column.name]))
+              .join(', '),
+        );
+        output.writeln(');');
+      }
+    }
+    for (final index in _indexes.values) {
+      if (index.schemaSql case final schema?) output.writeln('$schema;');
+    }
+    for (final view in _views.values) {
+      if (view.schemaSql case final schema?) output.writeln('$schema;');
+    }
+    for (final trigger in _triggers.values) {
+      if (trigger.schemaSql case final schema?) output.writeln('$schema;');
+    }
+    output
+      ..writeln('COMMIT;')
+      ..writeln('PRAGMA user_version=$_userVersion;')
+      ..writeln('PRAGMA application_id=$_applicationId;');
+    return output.toString();
+  });
+
   /// Commits [action] on success and rolls it back if [action] throws.
   ///
   /// Nested transactions are not supported for persistent databases.
@@ -9845,9 +9888,26 @@ class Database {
       },
   ];
 
+  /// Exports the current database as a SQL script.
+  String exportSql() => _database.exportSql();
+
   /// Closes the database and releases its resources.
   void dispose() => _database.close();
 }
+
+String _quoteSqlIdentifier(String name) => '"${name.replaceAll('"', '""')}"';
+
+String _sqlBackupLiteral(Object? value) => switch (value) {
+  null => 'NULL',
+  String text => "'${text.replaceAll("'", "''")}'",
+  int number => '$number',
+  double number when number.isFinite => '$number',
+  List<int> bytes =>
+    "X'${bytes.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join()}'",
+  _ => throw PureSqlException(
+    'unsupported SQL export value: ${value.runtimeType}',
+  ),
+};
 
 Object? _value(Object? value) {
   if (value == null || value is String || value is num) return value;
